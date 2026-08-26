@@ -12,6 +12,7 @@ import subprocess
 import unittest
 
 from harness import (
+    VERSION,
     ENGINE, LAUNCHER, REPO, ScratchHome, THEMES, TmuxServer, display_width,
     require, run, strip_ansi,
 )
@@ -37,7 +38,7 @@ class TestDispatch(CliTestCase):
         with ScratchHome() as home:
             r = sentinel("--version", home=home)
             self.assertEqual(r.returncode, 0, r.stderr)
-            self.assertIn("0.2.0", r.stdout)
+            self.assertIn(VERSION, r.stdout)
 
     def test_bare_invocation_on_a_pipe_does_not_crash(self):
         """v1: AttributeError: 'Namespace' object has no attribute 'theme'.
@@ -74,8 +75,12 @@ class TestValidation(CliTestCase):
         ("set", "position", "middle"),
         ("set", "glyphs", "emoji"),
         ("set", "cpu_warn_pct", "500"),
+        ("set", "always", "disk, cpu"),
+        ("set", "always", "nonsense"),
+        ("set", "always", "disk,nonsense"),
         ("theme", "no-such-theme"),
         ("toggle", "no-such-segment"),
+        ("always", "no-such-segment"),
     ]
 
     def test_out_of_domain_values_are_rejected(self):
@@ -110,6 +115,100 @@ class TestValidation(CliTestCase):
                 with self.subTest(theme=theme):
                     r = sentinel("theme", theme, home=home, server=server)
                     self.assertEqual(r.returncode, 0, r.stderr)
+
+
+class TestAlwaysVerb(CliTestCase):
+    """`@sentinel_always` replaced the global alerts_only boolean in 0.3.0."""
+
+    def _always(self, home, server):
+        """The *resolved* set, not the raw tmux option.
+
+        An unset option is meant to stay unset — defaults are applied at
+        read time rather than written onto the server — so the raw option
+        is empty until something changes it.
+        """
+        r = sentinel("get", "always", home=home, server=server)
+        self.assertEqual(r.returncode, 0, r.stderr)
+        return {s for s in r.stdout.strip().split(",") if s}
+
+    def test_disk_is_in_the_default_set(self):
+        with ScratchHome() as home, TmuxServer() as server:
+            self.assertIn("disk", self._always(home, server))
+
+    def test_verb_flips_one_segment_both_ways(self):
+        """Typing a whole comma list to turn one thing on is the papercut
+        `toggle` already exists to avoid."""
+        with ScratchHome() as home, TmuxServer() as server:
+            before = self._always(home, server)
+            self.assertNotIn("battery", before)
+
+            r = sentinel("always", "battery", home=home, server=server)
+            self.assertEqual(r.returncode, 0, r.stderr)
+            self.assertEqual(self._always(home, server), before | {"battery"})
+
+            r = sentinel("always", "battery", home=home, server=server)
+            self.assertEqual(r.returncode, 0, r.stderr)
+            self.assertEqual(self._always(home, server), before)
+
+    def test_every_segment_is_reachable(self):
+        """'for all options' — nothing is hardcoded out of the control."""
+        with ScratchHome() as home, TmuxServer() as server:
+            sentinel("apply", home=home, server=server)
+            for segment in ("thermal", "sleep_risk", "disk", "battery",
+                            "cpu", "memory", "multi_client", "clock"):
+                with self.subTest(segment=segment):
+                    r = sentinel("always", segment, home=home, server=server)
+                    self.assertEqual(r.returncode, 0, r.stderr)
+
+    def test_preview_reflects_the_setting(self):
+        """The preview renders the engine's bytes, so a config change the
+        preview cannot show would mean the two had drifted apart."""
+        require(ENGINE, "make")
+        with ScratchHome() as home, TmuxServer() as server:
+            sentinel("apply", home=home, server=server)
+            with_disk = sentinel("preview", home=home, server=server).stdout
+            self.assertIn("54G", strip_ansi(with_disk))
+
+            sentinel("always", "disk", home=home, server=server)
+            without = sentinel("preview", home=home, server=server).stdout
+            self.assertNotIn("54G", strip_ansi(without))
+
+    def test_removed_option_is_gone_from_the_cli(self):
+        with ScratchHome() as home, TmuxServer() as server:
+            r = sentinel("set", "alerts_only", "off", home=home, server=server)
+            self.assertNotEqual(r.returncode, 0)
+
+
+    def test_a_v0_2_options_file_still_works_after_upgrade(self):
+        """A removed option must not brick the CLI for anyone upgrading.
+
+        The first cut aborted with "unknown option @sentinel_alerts_only",
+        which meant every 0.2.0 user's `sentinel` stopped working the
+        moment they pulled.
+        """
+        with ScratchHome() as home, TmuxServer() as server:
+            (home.config_dir / "options.conf").write_text(
+                '# tmux-sentinel persisted options\n'
+                'set -ogq @sentinel_theme "nord"\n'
+                'set -ogq @sentinel_alerts_only "on"\n',
+                encoding="utf-8")
+
+            r = sentinel("get", "theme", home=home, server=server)
+            self.assertEqual(r.returncode, 0, r.stderr)
+            self.assertEqual(r.stdout.strip(), "nord",
+                             "surviving options must still be honoured")
+            self.assertIn("alerts_only", r.stderr)
+            self.assertIn("always", r.stderr,
+                          "the warning must name the replacement")
+
+    def test_a_genuinely_unknown_option_still_aborts(self):
+        """Tolerating removed keys must not become tolerating typos."""
+        with ScratchHome() as home, TmuxServer() as server:
+            (home.config_dir / "options.conf").write_text(
+                'set -ogq @sentinel_thmee "nord"\n', encoding="utf-8")
+            r = sentinel("get", "theme", home=home, server=server)
+            self.assertNotEqual(r.returncode, 0)
+            self.assertIn("thmee", r.stderr)
 
 
 class TestOptionsPersistence(CliTestCase):

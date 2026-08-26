@@ -115,7 +115,7 @@ def cmd_preview(args: argparse.Namespace) -> int:
 
     header = (f"{palette['name']} | glyphs: {glyphs['name']} | "
               f"position: {opts.get('position')} | "
-              f"alerts_only: {opts.get('alerts_only')}")
+              f"always: {opts.get('always') or '(none)'}")
     out(renderer.truncate_to_width(header, width))
     out()
     for sim in sims:
@@ -163,6 +163,16 @@ def cmd_toggle(args: argparse.Namespace) -> int:
     enabled = opts.toggle_segment(args.segment)
     state = "enabled" if enabled else "disabled"
     return _commit(opts, f"segment {args.segment} {state}")
+
+
+def cmd_always(args: argparse.Namespace) -> int:
+    opts = O.load()
+    on = opts.toggle_always(args.segment)
+    if args.segment in O.INERT_ALWAYS:
+        note(f"{args.segment} has no quiet state; it renders either way")
+    current = opts.get("always") or "(none)"
+    state = "always visible" if on else "only when it has something to report"
+    return _commit(opts, f"{args.segment} {state}; always = {current}")
 
 
 def cmd_set(args: argparse.Namespace) -> int:
@@ -650,7 +660,7 @@ def _bare(args: argparse.Namespace) -> int:
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         prog="sentinel",
-        description="tmux-sentinel: alerts-only tmux status bar, "
+        description="tmux-sentinel: a quiet tmux status bar, "
                     "configured through tmux options.",
     )
     parser.add_argument("--version", action="version",
@@ -688,6 +698,12 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("segment", choices=list(O.SEGMENTS), metavar="<segment>",
                    help="one of: " + ", ".join(O.SEGMENTS))
     p.set_defaults(func=cmd_toggle)
+
+    p = sub.add_parser("always",
+                       help="flip one segment's resting visibility on/off")
+    p.add_argument("segment", choices=list(O.SEGMENTS), metavar="<segment>",
+                   help="one of: " + ", ".join(O.SEGMENTS))
+    p.set_defaults(func=cmd_always)
 
     p = sub.add_parser("set", help="set one setting")
     p.add_argument("key", metavar="<key>", help="one of: " + ", ".join(O.KEYS))

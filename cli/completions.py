@@ -15,8 +15,9 @@ from . import themes
 COMPLETIONS_DIR = O.REPO_ROOT / "completions"
 
 COMMANDS = (
-    "customize", "tui", "preview", "theme", "themes", "toggle", "set", "get",
-    "apply", "reload", "doctor", "install", "uninstall", "completion",
+    "customize", "tui", "preview", "theme", "themes", "toggle", "always",
+    "set", "get", "apply", "reload", "doctor", "install", "uninstall",
+    "completion",
 )
 
 
@@ -50,7 +51,7 @@ _sentinel() {{
     theme|themes)
         COMPREPLY=($(compgen -W "{' '.join(themes.list_themes())}" -- "$cur"))
         ;;
-    toggle)
+    toggle|always)
         COMPREPLY=($(compgen -W "{' '.join(O.SEGMENTS)}" -- "$cur"))
         ;;
     get)
@@ -109,6 +110,7 @@ _sentinel() {{
         'preview:render the real bar in this terminal'
         'theme:list or set the theme'
         'toggle:enable/disable one segment'
+        'always:flip one segment resting visibility on/off'
         'set:set one setting'
         'get:print settings'
         'apply:regenerate artifacts and reload tmux'
@@ -127,7 +129,7 @@ _sentinel() {{
     theme|themes)
         _values 'theme' {theme_list}
         ;;
-    toggle)
+    toggle|always)
         _values 'segment' {' '.join(O.SEGMENTS)}
         ;;
     get)

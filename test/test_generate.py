@@ -18,18 +18,23 @@ from harness import (
     require, run,
 )
 
+SEGMENTS = ("thermal", "sleep_risk", "disk", "battery",
+            "cpu", "memory", "multi_client", "clock")
+
+# Segments that render even with nothing to report, out of the box. `disk` is
+# here because free space is the one figure people want a resting readout of.
+DEFAULT_ALWAYS = {"disk", "cpu", "memory", "clock"}
+
 REQUIRED_STATE_KEYS = {
-    "version", "alerts_only", "clock_format",
+    "version", "clock_format",
     "color_fg", "color_dim", "color_val", "color_sep",
     "color_alert", "color_warn", "color_peach", "color_info",
-    "seg_thermal", "seg_sleep_risk", "seg_disk", "seg_battery",
-    "seg_cpu", "seg_memory", "seg_multi_client", "seg_clock",
     "glyph_sep", "glyph_thermal", "glyph_sleep", "glyph_disk",
     "glyph_battery_full", "glyph_battery_mid", "glyph_battery_low",
     "glyph_cpu", "glyph_memory", "glyph_clients",
     "disk_warn_gb", "disk_crit_gb", "cpu_warn_pct", "cpu_crit_pct",
     "battery_warn_pct", "battery_crit_pct",
-}
+} | {f"seg_{s}" for s in SEGMENTS} | {f"always_{s}" for s in SEGMENTS}
 
 
 class GenerateTestCase(unittest.TestCase):
@@ -82,6 +87,64 @@ class TestStateGrammar(GenerateTestCase):
             self.assertNotIn("export ", body)
             self.assertNotIn("$(", body)
             self.assertNotIn("`", body)
+
+
+class TestAlwaysFlags(GenerateTestCase):
+    """`@sentinel_always` replaced the global alerts_only boolean in 0.3.0."""
+
+    def _always(self, server, home, value=None):
+        opts = {"always": value} if value is not None else {}
+        self.generate(server, home, **opts)
+        state = parse_kv(home.state.read_text(encoding="utf-8"))
+        return {s for s in SEGMENTS if state.get(f"always_{s}") == "1"}
+
+    def test_disk_is_visible_out_of_the_box(self):
+        """The headline of this release: free space needs no configuration."""
+        with TmuxServer() as server, ScratchHome() as home:
+            self.assertIn("disk", self._always(server, home))
+
+    def test_default_matches_the_documented_set(self):
+        with TmuxServer() as server, ScratchHome() as home:
+            self.assertEqual(self._always(server, home), DEFAULT_ALWAYS)
+
+    def test_the_list_drives_the_flags(self):
+        with TmuxServer() as server, ScratchHome() as home:
+            for value, expected in (
+                ("disk", {"disk"}),
+                ("thermal,battery", {"thermal", "battery"}),
+                (",".join(SEGMENTS), set(SEGMENTS)),
+            ):
+                with self.subTest(always=value):
+                    self.assertEqual(self._always(server, home, value), expected)
+
+    def test_every_segment_can_be_given_a_resting_state(self):
+        """'for all options' — no segment is hardcoded out of the control."""
+        with TmuxServer() as server, ScratchHome() as home:
+            for segment in SEGMENTS:
+                with self.subTest(segment=segment):
+                    self.assertIn(segment, self._always(server, home, segment))
+
+    def test_malformed_lists_fall_back_to_the_default(self):
+        with TmuxServer() as server, ScratchHome() as home:
+            for bad in ("disk, cpu", "nonsense", "disk,nonsense", "", "disk;cpu"):
+                with self.subTest(always=bad):
+                    self.assertEqual(self._always(server, home, bad), DEFAULT_ALWAYS)
+
+    def test_removed_option_is_not_silently_ignored(self):
+        """Dropping a setting the user wrote without a word is the exact
+        'knob that lies' defect this project already fixed once."""
+        with TmuxServer() as server, ScratchHome() as home:
+            server.set_option("@sentinel_alerts_only", "off")
+            result = self.generate(server, home)
+            message = (result.stdout + result.stderr).lower()
+            self.assertIn("alerts_only", message)
+            self.assertIn("always", message)
+
+    def test_alerts_only_no_longer_appears_in_generated_state(self):
+        with TmuxServer() as server, ScratchHome() as home:
+            self.generate(server, home)
+            self.assertNotIn("alerts_only",
+                             home.state.read_text(encoding="utf-8"))
 
 
 class TestTmuxAcceptsEveryGeneratedConfig(GenerateTestCase):

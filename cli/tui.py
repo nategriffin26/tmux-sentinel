@@ -212,6 +212,19 @@ SEGMENT_HELP = {
     "clock": "the time",
 }
 
+#: Why each segment might want a visible resting state.  The three segments
+#: with no quiet state say so, rather than pretending the flag does something.
+ALWAYS_HELP = {
+    "thermal": "resting thermal reading, not just alerts",
+    "sleep_risk": "resting idle-sleep countdown",
+    "disk": "free space while it is still healthy",
+    "battery": "charge level while not discharging",
+    "cpu": "inert: cpu has no quiet state and always renders",
+    "memory": "inert: memory has no quiet state and always renders",
+    "multi_client": "client count even with one client attached",
+    "clock": "inert: the clock has no quiet state and always renders",
+}
+
 WINDOW_HELP = (
     ("hidden", "Zen: no window list at all"),
     ("minimal", "Compact text window indicators"),
@@ -272,7 +285,8 @@ class SentinelTUI:
             Category("Theme", self._items_theme),
             Category("Segments", self._items_segments,
                      "Enter/Space toggles a segment"),
-            Category("Steady state", self._items_alerts),
+            Category("Resting state", self._items_always,
+                     "Enter/Space flips whether a segment shows when quiet"),
             Category("Glyphs", self._items_glyphs),
             Category("Position", self._items_position),
             Category("Window list", self._items_windows),
@@ -310,13 +324,16 @@ class SentinelTUI:
             for name in O.SEGMENTS
         ]
 
-    def _items_alerts(self) -> List[Item]:
-        current = self.opts.get("alerts_only")
+    def _items_always(self) -> List[Item]:
+        resting = set(self.opts.always_list())
         return [
-            Item("Alerts only", "quiet until something needs attention",
-                 current == "on", action=lambda: self._stage("alerts_only", "on")),
-            Item("Always on", "show every enabled metric continuously",
-                 current == "off", action=lambda: self._stage("alerts_only", "off")),
+            Item(
+                label=name,
+                detail=("on  " if name in resting else "off ") + ALWAYS_HELP[name],
+                current=(name in resting),
+                action=lambda n=name: self._toggle_always(n),
+            )
+            for name in O.SEGMENTS
         ]
 
     def _items_glyphs(self) -> List[Item]:
@@ -397,6 +414,19 @@ class SentinelTUI:
         enabled = self.opts.toggle_segment(name)
         self._preview_cache.clear()
         return f"segment {name} {'enabled' if enabled else 'disabled'}"
+
+    def _toggle_always(self, name: str) -> str:
+        try:
+            on = self.opts.toggle_always(name)
+        except O.OptionError as exc:
+            return str(exc)
+        self._preview_cache.clear()
+        if name in O.INERT_ALWAYS:
+            return (f"always_{name} = {1 if on else 0}, but {name} has no quiet "
+                    "state and renders either way")
+        if on:
+            return f"{name} now shows a resting value"
+        return f"{name} is now quiet until it has something to report"
 
     def _adjust(self, key: str, delta: int) -> str:
         value = self.opts.int_of(key) + delta

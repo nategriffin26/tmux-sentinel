@@ -38,16 +38,23 @@ set -ogq @sentinel_interval "10"
 # font with box-drawing and symbol coverage; `ascii` is safe everywhere.
 set -ogq @sentinel_glyphs "nerd"
 
-# Quiet mode. Domain: on | off. When `on`, the ambient-health segments
-# (thermal, disk, battery) stay hidden until they cross a threshold, so the bar
-# is empty of noise and a visible segment always means something. When `off`,
-# every enabled segment renders continuously.
-set -ogq @sentinel_alerts_only "on"
-
 # Segments to render, in the fixed order thermal, sleep_risk, disk, battery,
 # cpu, memory, multi_client, clock. Domain: comma-separated list with no
 # spaces, drawn from exactly those eight names. Omitting a name disables it.
 set -ogq @sentinel_segments "thermal,sleep_risk,disk,battery,cpu,memory,multi_client,clock"
+
+# Which segments keep a resting state. @sentinel_segments above decides which
+# segments exist; this decides which of them are always on screen rather than
+# appearing only when they have something to report — a thermal warning, a
+# discharging battery, a second attached client, a disk running low.
+# Domain: comma-separated list with no spaces, drawn from the same eight names.
+#
+# cpu, memory and clock have no quiet state to suppress: they render whatever
+# you put here. Listing them is inert but harmless, and the default lists them
+# so that this line reads as the complete set of normally visible segments.
+# To keep the bar silent until something is worth saying, name only a segment
+# that renders anyway, e.g. "cpu".
+set -ogq @sentinel_always "disk,cpu,memory,clock"
 
 # Window list style. Domain: hidden | minimal | tabs.
 #   hidden  — no window list at all; the bar shows session identity and health.
@@ -72,8 +79,8 @@ set -ogq @sentinel_session_max_length "18"
 set -ogq @sentinel_accent ""
 
 # Free disk space, in whole gigabytes, below which the disk segment turns
-# warning-coloured (and, under alerts_only, becomes visible at all).
-# Domain: integer 0..100000. Comparison is strict `<`.
+# warning-coloured (and, when disk is not listed in @sentinel_always, becomes
+# visible at all). Domain: integer 0..100000. Comparison is strict `<`.
 set -ogq @sentinel_disk_warn_gb "25"
 
 # Free disk space, in whole gigabytes, below which the disk segment turns

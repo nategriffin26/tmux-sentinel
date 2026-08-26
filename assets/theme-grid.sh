@@ -6,6 +6,13 @@ set -euo pipefail
 REPO="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 WIDTH="${1:-72}"
 
+# Render against a throwaway config so the output is identical on any machine
+# and cannot be perturbed by whatever the author happens to have set.
+SCRATCH="$(mktemp -d "${TMPDIR:-/tmp}/sentinel-grid.XXXXXX")"
+trap 'rm -rf "$SCRATCH"' EXIT
+export XDG_CONFIG_HOME="$SCRATCH/config"
+mkdir -p "$XDG_CONFIG_HOME"
+
 printf '\n'
 for palette in "$REPO"/themes/*.palette; do
     theme="$(basename "$palette" .palette)"

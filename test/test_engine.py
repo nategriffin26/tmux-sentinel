@@ -12,6 +12,7 @@ import time
 import unittest
 
 from harness import (
+    VERSION,
     ENGINE, REPO, ScratchHome, display_width, parse_kv, require, run, strip_tmux,
 )
 
@@ -71,7 +72,7 @@ class TestSimulateContract(EngineTestCase):
     def test_documented_simulate_values_appear(self):
         """CONTRACT §4 pins these so docs, tests and preview agree."""
         healthy = strip_tmux(engine("--simulate", "healthy").stdout)
-        for token in ("22%", "23.3G", "14:30"):
+        for token in ("54G", "22%", "23.3G", "14:30"):
             with self.subTest(state="healthy", token=token):
                 self.assertIn(token, healthy)
 
@@ -80,18 +81,18 @@ class TestSimulateContract(EngineTestCase):
             with self.subTest(state="alert", token=token):
                 self.assertIn(token, alert)
 
-    def test_healthy_state_shows_only_ambient_segments(self):
-        """The product's thesis, pinned.
+    def test_healthy_bar_is_disk_cpu_memory_clock(self):
+        """The product's thesis, pinned to the shipped defaults.
 
-        Under the default alerts_only, a healthy host shows CPU, memory and
-        the clock and nothing else. Disk at 54 GB is above the warn
-        threshold, so it must stay hidden — v1 leaked it because its
-        alerts-only branch emitted the healthy segment anyway.
+        Free disk space earns a resting slot because it is the one figure
+        people actually want at a glance. Everything with a genuine alert
+        condition stays quiet until it fires.
         """
         healthy = strip_tmux(engine("--simulate", "healthy").stdout)
-        for hidden, why in (("54G", "disk above threshold"),
-                            ("10m", "sleep risk"),
-                            ("95%", "battery on AC")):
+        self.assertIn("54G", healthy, "free disk space should be visible by default")
+        for hidden, why in (("10m", "sleep risk"),
+                            ("95%", "battery on AC"),
+                            ("Nominal", "nominal thermal")):
             with self.subTest(segment=why):
                 self.assertNotIn(hidden, healthy,
                                  f"{why} leaked into the healthy bar: {healthy!r}")
@@ -132,7 +133,7 @@ class TestLiveProbes(EngineTestCase):
     def test_version(self):
         r = engine("--version")
         self.assertEqual(r.returncode, 0)
-        self.assertIn("0.2.0", r.stdout)
+        self.assertIn(VERSION, r.stdout)
 
     def test_unknown_flag_is_a_usage_error(self):
         r = engine("--nonsense")
@@ -144,11 +145,25 @@ class TestStateFileRobustness(EngineTestCase):
     """CONTRACT §1: a bad state file must never break the status bar."""
 
     def _render(self, body: str) -> str:
+        """Render against the live host — for parser-robustness checks."""
         with ScratchHome() as home:
             home.state.write_text(body, encoding="utf-8")
             r = engine("--state", str(home.state))
             self.assertEqual(r.returncode, 0, r.stderr)
             return r.stdout
+
+    def _simulate(self, body: str, mode: str = "healthy") -> str:
+        """Render the fixed synthetic metrics under a given state file.
+
+        Visibility rules must be asserted against these rather than the live
+        host, whose real disk and battery figures are not the documented
+        ones.
+        """
+        with ScratchHome() as home:
+            home.state.write_text(body, encoding="utf-8")
+            r = engine("--state", str(home.state), "--simulate", mode)
+            self.assertEqual(r.returncode, 0, r.stderr)
+            return strip_tmux(r.stdout)
 
     def test_missing_file_falls_back_to_builtin_defaults(self):
         r = engine("--state", "/nonexistent/sentinel.state")
@@ -178,6 +193,42 @@ class TestStateFileRobustness(EngineTestCase):
         without = strip_tmux(self._render("version=1\nseg_cpu=0\n"))
         self.assertNotEqual(with_cpu, without)
         self.assertLess(display_width(without), display_width(with_cpu))
+
+    def test_always_flag_gives_a_segment_a_resting_state(self):
+        """Each segment's resting visibility is independently controllable.
+
+        The old design was one global boolean standing in for eight
+        decisions, which forced disk to be either always hidden or shown
+        alongside everything else.
+        """
+        for segment, token in (("thermal", "Nominal"),
+                               ("battery", "95%"),
+                               ("sleep_risk", "30m")):
+            off = self._simulate(f"version=1\nalways_{segment}=0\n")
+            on = self._simulate(f"version=1\nalways_{segment}=1\n")
+            with self.subTest(segment=segment):
+                self.assertNotIn(token, off)
+                self.assertIn(token, on)
+
+    def test_disk_resting_state_can_be_turned_off(self):
+        self.assertIn("54G", self._simulate("version=1\nalways_disk=1\n"))
+        self.assertNotIn("54G", self._simulate("version=1\nalways_disk=0\n"))
+
+    def test_disk_is_visible_with_no_state_file_at_all(self):
+        """Built-in defaults, not just generated ones, must show disk."""
+        result = engine("--state", "/nonexistent/sentinel.state",
+                        "--simulate", "healthy")
+        self.assertIn("54G", strip_tmux(result.stdout))
+
+    def test_multi_client_resting_state_shows_a_single_client(self):
+        on = self._simulate("version=1\nalways_multi_client=1\n")
+        off = self._simulate("version=1\nalways_multi_client=0\n")
+        self.assertNotEqual(on, off)
+
+    def test_seg_off_beats_always_on(self):
+        """A segment that does not exist cannot have a resting state."""
+        self.assertNotIn("95%", self._simulate(
+            "version=1\nseg_battery=0\nalways_battery=1\n"))
 
     def test_all_segments_off_yields_empty_output_not_a_bare_separator(self):
         body = "version=1\n" + "".join(

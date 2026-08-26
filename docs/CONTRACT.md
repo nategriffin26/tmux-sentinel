@@ -48,7 +48,8 @@ Written by `scripts/generate.sh`. Read by `src/sentinel-status.c`.
 - The writer MUST reject/strip any value containing CR or LF. Values are otherwise opaque.
 - Max line length the reader must handle: 512 bytes. Longer lines: skip the line.
 - Missing file, or missing key: reader uses its built-in default (Catppuccin Mocha,
-  all segments on, alerts_only=1, nerd glyphs, default thresholds). Reader NEVER fails
+  all segments on, the default `always` set, nerd glyphs, default thresholds).
+  Reader NEVER fails
   because of a bad state file.
 
 ### Complete key list
@@ -56,7 +57,17 @@ Written by `scripts/generate.sh`. Read by `src/sentinel-status.c`.
 ```
 version=1
 
-alerts_only=1                 # 0|1
+# Per-segment visibility floor. 1 = render even when the segment has nothing
+# to report; 0 = render only when it has crossed a threshold. Segments with no
+# quiet state (cpu, memory, clock) render regardless and ignore this.
+always_thermal=0
+always_sleep_risk=0
+always_disk=1
+always_battery=0
+always_cpu=1
+always_memory=1
+always_multi_client=0
+always_clock=1
 clock_format=%H:%M            # strftime, applied by the binary
 
 color_fg=#cdd6f4
@@ -129,19 +140,23 @@ Segments render in this fixed order, joined by `#[fg=<color_sep>]<glyph_sep>` pl
 
 `thermal, sleep_risk, disk, battery, cpu, memory, multi_client, clock`
 
-A segment disabled via `seg_*=0` never renders.
+A segment disabled via `seg_*=0` never renders. A segment whose `always_*=0`
+renders only when it has something to report; `always_*=1` gives it a visible
+resting state. `cpu`, `memory` and `clock` have no resting state to suppress,
+so they always render and their `always_*` key is accepted but inert.
 
 | Segment | Renders when | Output |
 |---|---|---|
-| thermal | throttled (limit < 100, or Linux pkg temp >= 80C) | `#[fg=ALERT]{glyph_thermal} {v}%` (Linux: `{v}°C`) |
-| thermal | not throttled AND `alerts_only=0` | `#[fg=DIM]{glyph_thermal} #[fg=VAL]{v}%` |
+| thermal | pressure above nominal | `#[fg=ALERT]{glyph_thermal} {word}` (Linux: `{n}°C`) |
+| thermal | nominal AND `always_thermal=1` | `#[fg=DIM]{glyph_thermal} #[fg=VAL]{word}` |
 | sleep_risk | idle sleep armed and no wake assertion held | `#[fg=ALERT]{glyph_sleep} {mins}m` |
-| disk | `alerts_only=0` OR free < `disk_warn_gb` | `#[fg=DIM]{glyph_disk} #[fg=C]{gb}G` |
+| sleep_risk | not at risk AND `always_sleep_risk=1` | `#[fg=DIM]{glyph_sleep} #[fg=VAL]{mins}m`, or `off` when idle sleep is disabled |
+| disk | free < `disk_warn_gb`, OR `always_disk=1` | `#[fg=DIM]{glyph_disk} #[fg=C]{gb}G` |
 | battery | discharging | `#[fg=C]{icon} {pct}%` |
-| battery | not discharging AND `alerts_only=0` | `#[fg=DIM]{glyph_battery_full} #[fg=VAL]{pct}%` |
-| cpu | always (ambient) | `#[fg=DIM]{glyph_cpu} #[fg=C]{pct}%` — pct right-aligned width 2 |
-| memory | always (ambient) | `#[fg=DIM]{glyph_memory} #[fg=C]{swap}` e.g. `23.3G` |
-| multi_client | clients > 1 | `#[fg=INFO]{glyph_clients} {n}` |
+| battery | not discharging AND `always_battery=1` | `#[fg=DIM]{glyph_battery_full} #[fg=VAL]{pct}%` |
+| cpu | always | `#[fg=DIM]{glyph_cpu} #[fg=C]{pct}%` — pct right-aligned width 2 |
+| memory | always | `#[fg=DIM]{glyph_memory} #[fg=C]{swap}` e.g. `23.3G` |
+| multi_client | clients > 1, OR `always_multi_client=1` | `#[fg=INFO]{glyph_clients} {n}` |
 | clock | always | `#[fg=FG,bold]{strftime(clock_format)}` |
 
 Colour selection (`C`):
@@ -159,16 +174,19 @@ Thresholds are strict as written above. `disk` uses `<`, `cpu` uses `>=`.
 
 These exist so the golden test can assert the preview equals the engine.
 
-`--simulate healthy`: thermal limit 100 (nominal), sleep risk none, disk 54 GB,
-battery 95% not discharging, cpu 22, swap `23.3G`, memory pressure 1, clients 1,
-clock renders the literal string `14:30` (NOT current time — simulate must be
-deterministic; bypass strftime and emit `14:30`).
+`--simulate healthy`: thermal nominal, sleep risk none (30 minutes armed but an
+assertion is held), disk 54 GB, battery 95% not discharging, cpu 22, swap
+`23.3G`, memory pressure 1, clients 1, clock renders the literal string `14:30`
+(NOT current time — simulate must be deterministic; bypass strftime).
 
-`--simulate alert`: thermal limit 82, sleep risk armed with 10 minutes, disk 12 GB,
+`--simulate alert`: thermal `Fair`, sleep risk armed with 10 minutes, disk 12 GB,
 battery 18% discharging, cpu 94, swap `24.1G`, memory pressure 4, clients 2,
 clock `14:30`.
 
-`--clients` is ignored in simulate mode.
+Simulate honours the loaded `always_*` flags, so `sentinel preview` shows the
+user their own configuration rather than a fixed idea of it. With the shipped
+defaults, `--simulate healthy` therefore renders exactly: disk, cpu, memory,
+clock.
 
 ## 5. tmux options — normative names and defaults
 
@@ -181,7 +199,7 @@ as `set -ogq` lines so a user's `.tmux.conf` always wins.
 | `@sentinel_position` | `top` | `top`\|`bottom` |
 | `@sentinel_interval` | `10` | integer 1..3600 |
 | `@sentinel_glyphs` | `nerd` | `nerd`\|`unicode`\|`ascii` |
-| `@sentinel_alerts_only` | `on` | `on`\|`off` |
+| `@sentinel_always` | `disk,cpu,memory,clock` | comma list, no spaces, drawn from the eight segment names |
 | `@sentinel_segments` | `thermal,sleep_risk,disk,battery,cpu,memory,multi_client,clock` | comma list, no spaces |
 | `@sentinel_windows` | `hidden` | `hidden`\|`minimal`\|`tabs` |
 | `@sentinel_clock_format` | `%H:%M` | strftime; validated against `^[%A-Za-z0-9 :/.,+-]{1,32}$` |
@@ -198,6 +216,15 @@ as `set -ogq` lines so a user's `.tmux.conf` always wins.
 domain is replaced by the default AND reported via `tmux display-message`. Nothing
 user-controlled is ever interpolated into `sentinel.conf` without domain validation.
 This is the fix for the confirmed RCE; treat it as a hard requirement.
+
+`@sentinel_alerts_only` was removed in 0.3.0. It was a single boolean standing in
+for eight independent decisions, and it forced disk — the thing people most want
+a resting readout of — to be either always hidden or always shown along with
+everything else. `@sentinel_always` replaces it and subsumes both of its states:
+the old `on` is the shipped default, the old `off` is every segment listed.
+`scripts/generate.sh` MUST detect the dead option and say so via
+`tmux display-message`, because silently ignoring a setting the user wrote is
+the same "knob that lies" defect this project already fixed once.
 
 ## 6. Persistence of TUI/CLI edits
 

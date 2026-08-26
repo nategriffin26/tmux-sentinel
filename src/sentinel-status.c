@@ -39,7 +39,7 @@ extern CFDictionaryRef IOPMCopySystemPowerSettings(void);
 #error "sentinel-status supports only Darwin and Linux"
 #endif
 
-#define VERSION "0.2.0"
+#define VERSION "0.3.0"
 #define ARRAY_LEN(a) (sizeof(a) / sizeof((a)[0]))
 #define CPU_STATE_MAGIC UINT32_C(0x534e5432)
 #define CPU_STATE_VERSION 1U
@@ -49,7 +49,8 @@ extern CFDictionaryRef IOPMCopySystemPowerSettings(void);
 #define CPU_SAMPLE_NS (UINT64_C(80) * UINT64_C(1000000))
 
 struct config {
-    int alerts_only;
+    int always_thermal, always_sleep_risk, always_disk, always_battery;
+    int always_cpu, always_memory, always_multi_client, always_clock;
     char clock_format[129];
     char color_fg[32], color_dim[32], color_val[32], color_sep[32];
     char color_alert[32], color_warn[32], color_peach[32], color_info[32];
@@ -66,7 +67,7 @@ struct metrics {
     bool thermal_ok, thermal_alert;
     int thermal_value;
     char thermal_word[16];
-    bool sleep_ok, sleep_risk;
+    bool sleep_ok, sleep_risk, sleep_assertion_held;
     int sleep_minutes;
     bool disk_ok;
     int disk_free_gb;
@@ -109,7 +110,7 @@ static void copy_string(char *dst, size_t size, const char *src)
 static void config_defaults(struct config *c)
 {
     memset(c, 0, sizeof(*c));
-    c->alerts_only = 1;
+    c->always_disk = c->always_cpu = c->always_memory = c->always_clock = 1;
     copy_string(c->clock_format, sizeof(c->clock_format), "%H:%M");
     copy_string(c->color_fg, sizeof(c->color_fg), "#cdd6f4");
     copy_string(c->color_dim, sizeof(c->color_dim), "#6c7086");
@@ -179,7 +180,14 @@ static void parse_config_value(struct config *c, const char *key, const char *va
 #define BOOL_KEY(name, field) if (strcmp(key, name) == 0) { set_bool(value, &c->field); return; }
 #define INT_KEY(name, field, lo, hi) if (strcmp(key, name) == 0) { int v; if (parse_clamped_integer(value, lo, hi, &v)) c->field = v; return; }
     if (strcmp(key, "version") == 0) return;
-    BOOL_KEY("alerts_only", alerts_only)
+    BOOL_KEY("always_thermal", always_thermal)
+    BOOL_KEY("always_sleep_risk", always_sleep_risk)
+    BOOL_KEY("always_disk", always_disk)
+    BOOL_KEY("always_battery", always_battery)
+    BOOL_KEY("always_cpu", always_cpu)
+    BOOL_KEY("always_memory", always_memory)
+    BOOL_KEY("always_multi_client", always_multi_client)
+    BOOL_KEY("always_clock", always_clock)
     STRING_KEY("clock_format", clock_format)
     STRING_KEY("color_fg", color_fg)
     STRING_KEY("color_dim", color_dim)
@@ -492,7 +500,7 @@ static bool assertion_held(CFDictionaryRef assertions, CFStringRef key)
     return dict_number(assertions, key, &level) && level > 0;
 }
 
-static bool probe_sleep(bool *risk, int *minutes)
+static bool probe_sleep(bool *assertion_held_out, int *minutes)
 {
     CFDictionaryRef preferences = IOPMCopySystemPowerSettings();
     bool found = preferences != NULL && find_sleep_minutes(preferences, 0, minutes);
@@ -505,10 +513,10 @@ static bool probe_sleep(bool *risk, int *minutes)
     if (!found) return false;
     CFDictionaryRef assertions = NULL;
     if (IOPMCopyAssertionsStatus(&assertions) != kIOReturnSuccess || assertions == NULL) return false;
-    bool held = assertion_held(assertions, kIOPMAssertionTypePreventUserIdleSystemSleep) ||
-                assertion_held(assertions, kIOPMAssertionTypePreventSystemSleep);
+    *assertion_held_out =
+        assertion_held(assertions, kIOPMAssertionTypePreventUserIdleSystemSleep) ||
+        assertion_held(assertions, kIOPMAssertionTypePreventSystemSleep);
     CFRelease(assertions);
-    *risk = *minutes > 0 && !held;
     return true;
 }
 
@@ -530,7 +538,7 @@ static bool probe_thermal(bool *alert, int *level, char *word, size_t word_size)
 }
 
 #define PLATFORM_CACHE_MAGIC UINT32_C(0x534e5043)
-#define PLATFORM_CACHE_VERSION 1U
+#define PLATFORM_CACHE_VERSION 2U
 #define PLATFORM_CACHE_NS (UINT64_C(5) * NS_PER_SEC)
 
 struct platform_cache {
@@ -538,7 +546,7 @@ struct platform_cache {
     uint64_t timestamp_ns;
     int32_t thermal_ok, thermal_alert, thermal_value;
     char thermal_word[16];
-    int32_t sleep_ok, sleep_risk, sleep_minutes;
+    int32_t sleep_ok, sleep_assertion_held, sleep_minutes;
 };
 
 static void probe_cached_platform(struct metrics *m)
@@ -549,7 +557,8 @@ static void probe_cached_platform(struct metrics *m)
         if (fd >= 0) close(fd);
         m->thermal_ok = probe_thermal(&m->thermal_alert, &m->thermal_value,
                                       m->thermal_word, sizeof(m->thermal_word));
-        m->sleep_ok = probe_sleep(&m->sleep_risk, &m->sleep_minutes);
+        m->sleep_ok = probe_sleep(&m->sleep_assertion_held, &m->sleep_minutes);
+        m->sleep_risk = m->sleep_ok && m->sleep_minutes > 0 && !m->sleep_assertion_held;
         return;
     }
     ssize_t got = pread(fd, &cache, sizeof(cache), 0);
@@ -563,12 +572,14 @@ static void probe_cached_platform(struct metrics *m)
         m->thermal_value = cache.thermal_value;
         copy_string(m->thermal_word, sizeof(m->thermal_word), cache.thermal_word);
         m->sleep_ok = cache.sleep_ok != 0;
-        m->sleep_risk = cache.sleep_risk != 0;
+        m->sleep_assertion_held = cache.sleep_assertion_held != 0;
         m->sleep_minutes = cache.sleep_minutes;
+        m->sleep_risk = m->sleep_minutes > 0 && !m->sleep_assertion_held;
     } else {
         m->thermal_ok = probe_thermal(&m->thermal_alert, &m->thermal_value,
                                       m->thermal_word, sizeof(m->thermal_word));
-        m->sleep_ok = probe_sleep(&m->sleep_risk, &m->sleep_minutes);
+        m->sleep_ok = probe_sleep(&m->sleep_assertion_held, &m->sleep_minutes);
+        m->sleep_risk = m->sleep_ok && m->sleep_minutes > 0 && !m->sleep_assertion_held;
         memset(&cache, 0, sizeof(cache));
         cache.magic = PLATFORM_CACHE_MAGIC;
         cache.version = PLATFORM_CACHE_VERSION;
@@ -578,7 +589,7 @@ static void probe_cached_platform(struct metrics *m)
         cache.thermal_value = m->thermal_value;
         copy_string(cache.thermal_word, sizeof(cache.thermal_word), m->thermal_word);
         cache.sleep_ok = m->sleep_ok;
-        cache.sleep_risk = m->sleep_risk;
+        cache.sleep_assertion_held = m->sleep_assertion_held;
         cache.sleep_minutes = m->sleep_minutes;
         if (ftruncate(fd, 0) == 0)
             (void)pwrite(fd, &cache, sizeof(cache), 0);
@@ -789,7 +800,8 @@ static void collect_metrics(struct metrics *m, int clients, const struct config 
     if (all) {
         m->thermal_ok = probe_thermal(&m->thermal_alert, &m->thermal_value,
                                       m->thermal_word, sizeof(m->thermal_word));
-        m->sleep_ok = probe_sleep(&m->sleep_risk, &m->sleep_minutes);
+        m->sleep_ok = probe_sleep(&m->sleep_assertion_held, &m->sleep_minutes);
+        m->sleep_risk = m->sleep_ok && m->sleep_minutes > 0 && !m->sleep_assertion_held;
     } else if (config->seg_thermal || config->seg_sleep_risk) {
         probe_cached_platform(m);
     }
@@ -816,8 +828,9 @@ static void simulate_metrics(struct metrics *m, bool alert)
     m->thermal_alert = alert;
     m->thermal_value = alert ? 1 : 0;
     copy_string(m->thermal_word, sizeof(m->thermal_word), alert ? "Fair" : "Nominal");
+    m->sleep_assertion_held = !alert;
     m->sleep_risk = alert;
-    m->sleep_minutes = alert ? 10 : 0;
+    m->sleep_minutes = alert ? 10 : 30;
     m->disk_free_gb = alert ? 12 : 54;
     m->battery_present = true;
     m->battery_discharging = alert;
@@ -854,28 +867,34 @@ static void render(const struct config *c, const struct metrics *m, struct outbu
 {
     char segment[512];
     memset(out, 0, sizeof(*out));
-    if (c->seg_thermal && m->thermal_ok && (m->thermal_alert || !c->alerts_only)) {
+    if (c->seg_thermal && m->thermal_ok && (m->thermal_alert || c->always_thermal)) {
         if (m->thermal_word[0] != '\0') {
             if (m->thermal_alert) snprintf(segment, sizeof(segment), "#[fg=%s]%s %s", c->color_alert, c->glyph_thermal, m->thermal_word);
             else snprintf(segment, sizeof(segment), "#[fg=%s]%s #[fg=%s]%s", c->color_dim, c->glyph_thermal, c->color_val, m->thermal_word);
+        } else if (m->thermal_alert) {
+            snprintf(segment, sizeof(segment), "#[fg=%s]%s %d°C", c->color_alert, c->glyph_thermal, m->thermal_value);
         } else {
-            const char *color = m->thermal_alert ? c->color_alert : c->color_val;
-            snprintf(segment, sizeof(segment), "#[fg=%s]%s %d°C", color, c->glyph_thermal, m->thermal_value);
+            snprintf(segment, sizeof(segment), "#[fg=%s]%s #[fg=%s]%d°C", c->color_dim, c->glyph_thermal, c->color_val, m->thermal_value);
         }
         join_segment(out, c, segment);
     }
-    if (c->seg_sleep_risk && m->sleep_ok && m->sleep_risk) {
-        snprintf(segment, sizeof(segment), "#[fg=%s]%s %dm", c->color_alert, c->glyph_sleep, m->sleep_minutes);
+    if (c->seg_sleep_risk && m->sleep_ok && (m->sleep_risk || c->always_sleep_risk)) {
+        if (m->sleep_risk)
+            snprintf(segment, sizeof(segment), "#[fg=%s]%s %dm", c->color_alert, c->glyph_sleep, m->sleep_minutes);
+        else if (m->sleep_minutes == 0)
+            snprintf(segment, sizeof(segment), "#[fg=%s]%s #[fg=%s]off", c->color_dim, c->glyph_sleep, c->color_val);
+        else
+            snprintf(segment, sizeof(segment), "#[fg=%s]%s #[fg=%s]%dm", c->color_dim, c->glyph_sleep, c->color_val, m->sleep_minutes);
         join_segment(out, c, segment);
     }
-    if (c->seg_disk && m->disk_ok && (!c->alerts_only || m->disk_free_gb < c->disk_warn_gb)) {
+    if (c->seg_disk && m->disk_ok && (m->disk_free_gb < c->disk_warn_gb || c->always_disk)) {
         const char *color = c->color_val;
         if (m->disk_free_gb < c->disk_crit_gb) color = c->color_alert;
         else if (m->disk_free_gb < c->disk_warn_gb) color = c->color_warn;
         snprintf(segment, sizeof(segment), "#[fg=%s]%s #[fg=%s]%dG", c->color_dim, c->glyph_disk, color, m->disk_free_gb);
         join_segment(out, c, segment);
     }
-    if (c->seg_battery && m->battery_ok && m->battery_present && (m->battery_discharging || !c->alerts_only)) {
+    if (c->seg_battery && m->battery_ok && m->battery_present && (m->battery_discharging || c->always_battery)) {
         if (!m->battery_discharging) {
             snprintf(segment, sizeof(segment), "#[fg=%s]%s #[fg=%s]%d%%", c->color_dim, c->glyph_battery_full, c->color_val, m->battery_pct);
         } else {
@@ -901,7 +920,7 @@ static void render(const struct config *c, const struct metrics *m, struct outbu
         snprintf(segment, sizeof(segment), "#[fg=%s]%s #[fg=%s]%.1fG", c->color_dim, c->glyph_memory, color, m->swap_gb);
         join_segment(out, c, segment);
     }
-    if (c->seg_multi_client && m->clients > 1) {
+    if (c->seg_multi_client && (m->clients > 1 || c->always_multi_client)) {
         snprintf(segment, sizeof(segment), "#[fg=%s]%s %d", c->color_info, c->glyph_clients, m->clients);
         join_segment(out, c, segment);
     }
@@ -928,7 +947,14 @@ static int run_selftest(const struct metrics *m)
 #endif
     selftest_line("thermal", value, m->thermal_ok);
 #ifdef __APPLE__
-    snprintf(value, sizeof(value), m->sleep_ok ? "%dm%s" : "unavailable", m->sleep_minutes, m->sleep_risk ? " risk" : " safe");
+    if (m->sleep_ok) {
+        const char *timer = m->sleep_minutes == 0 ? "off" : "armed";
+        snprintf(value, sizeof(value), "timer %s (%dm), assertion %s, %s",
+                 timer, m->sleep_minutes, m->sleep_assertion_held ? "held" : "not held",
+                 m->sleep_risk ? "risk" : "safe");
+    } else {
+        snprintf(value, sizeof(value), "unavailable");
+    }
 #else
     snprintf(value, sizeof(value), "not implemented on Linux");
 #endif

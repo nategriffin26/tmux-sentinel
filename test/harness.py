@@ -24,6 +24,13 @@ LAUNCHER = REPO / "bin" / "sentinel"
 THEMES = sorted(p.stem for p in (REPO / "themes").glob("*.palette"))
 GLYPH_MODES = sorted(p.stem for p in (REPO / "glyphs").glob("*.glyphs"))
 
+# Derived, never restated: a hardcoded copy here would drift the moment the
+# project is versioned, and the tests exist to catch drift.
+VERSION = re.search(
+    r'__version__\s*=\s*"([^"]+)"',
+    (REPO / "cli" / "__init__.py").read_text(encoding="utf-8"),
+).group(1)
+
 # CONTRACT §3 — the fixed segment order.
 SEGMENT_ORDER = [
     "thermal", "sleep_risk", "disk", "battery",

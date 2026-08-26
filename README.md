@@ -25,14 +25,18 @@ Most status bars are always shouting. A permanent CPU widget reading `4%` tells
 you nothing, costs a fork every tick, and trains you to ignore the bar — so the
 one time it reads `98%` you don't notice either.
 
-tmux-sentinel inverts that. A healthy machine shows **CPU, memory and the
-clock**. Everything else stays hidden until it crosses a threshold, so a
-segment appearing *is* the signal.
+tmux-sentinel inverts that. A healthy machine shows **free disk space, CPU,
+memory and the clock**. Everything with a real alert condition stays hidden
+until it crosses a threshold, so a segment appearing *is* the signal.
 
-|                    | healthy                          | something wrong                                              |
-| ------------------ | -------------------------------- | ------------------------------------------------------------ |
-| what you see       | cpu · memory · clock             | throttling · sleep armed · disk low · battery draining · …    |
-| segments rendered  | 3                                | up to 8                                                       |
+|                    | healthy                                  | something wrong                                            |
+| ------------------ | ---------------------------------------- | ---------------------------------------------------------- |
+| what you see       | disk · cpu · memory · clock              | throttling · sleep armed · disk low · battery draining · …  |
+| segments rendered  | 4                                        | up to 8                                                     |
+
+Which segments get that resting slot is entirely yours — `@sentinel_always`
+controls it per segment, so you can put battery on the bar permanently, or
+strip it back to just the clock.
 
 It is also cheap enough to leave on. The whole bar is rendered by one native
 binary that makes **zero child processes** per tick.
@@ -77,7 +81,12 @@ set -g @sentinel_position       'bottom'
 set -g @sentinel_glyphs         'ascii'      # no Nerd Font required
 set -g @sentinel_disk_warn_gb   '50'
 set -g @sentinel_segments       'disk,battery,cpu,memory,clock'
+set -g @sentinel_always         'disk,battery,cpu,memory,clock'
 ```
+
+`@sentinel_segments` decides which segments **exist**. `@sentinel_always`
+decides which of them have a **resting state** rather than appearing only when
+they have something to report.
 
 <details>
 <summary><strong>All options</strong></summary>
@@ -88,7 +97,7 @@ set -g @sentinel_segments       'disk,battery,cpu,memory,clock'
 | `@sentinel_position` | `top` | `top` · `bottom` |
 | `@sentinel_interval` | `10` | integer 1–3600 (seconds) |
 | `@sentinel_glyphs` | `nerd` | `nerd` · `unicode` · `ascii` |
-| `@sentinel_alerts_only` | `on` | `on` · `off` |
+| `@sentinel_always` | `disk,cpu,memory,clock` | comma list, no spaces |
 | `@sentinel_segments` | all eight | comma list, no spaces |
 | `@sentinel_windows` | `hidden` | `hidden` · `minimal` · `tabs` |
 | `@sentinel_clock_format` | `%H:%M` | strftime, 1–32 chars |
@@ -121,18 +130,26 @@ running tmux server immediately and persist to
 
 ## Segments
 
-| Segment | Appears when | Shows |
-| --- | --- | --- |
-| **Thermal** | the OS reports thermal pressure above nominal | `Fair` · `Serious` · `Critical` (Linux: `N°C`, alert at 80°C) |
-| **Sleep risk** | idle sleep is armed and nothing holds a wake assertion | minutes until sleep — the thing that kills remote `mosh`/`ssh`/agent sessions |
-| **Disk** | free space below `disk_warn_gb` | gigabytes free |
-| **Battery** | discharging | charge percent, icon and colour stepping down by threshold |
-| **CPU** | always | utilisation from real tick deltas, not load average |
-| **Memory** | always | swap in use, coloured by kernel memory-pressure level |
-| **Clients** | more than one client attached | client count |
-| **Clock** | always | your `clock_format` |
+| Segment | Alerts when | Resting state | Shows |
+| --- | --- | --- | --- |
+| **Thermal** | pressure above nominal | opt-in | `Fair` · `Serious` · `Critical` (Linux: `N°C`, alert at 80°C) |
+| **Sleep risk** | idle sleep armed, nothing holding a wake assertion | opt-in | minutes until sleep — the thing that kills remote `mosh`/`ssh`/agent sessions |
+| **Disk** | free space below `disk_warn_gb` | **default** | gigabytes free |
+| **Battery** | discharging | opt-in | charge percent, icon and colour stepping down by threshold |
+| **CPU** | above `cpu_warn_pct` | always | utilisation from real tick deltas, not load average |
+| **Memory** | kernel memory pressure | always | swap in use |
+| **Clients** | more than one attached | opt-in | client count |
+| **Clock** | — | always | your `clock_format` |
 
-Set `@sentinel_alerts_only 'off'` to render every enabled segment continuously.
+"Resting state" is what the segment does when it has nothing to report:
+**default** and **opt-in** are both just membership of `@sentinel_always`,
+which you can change per segment. **always** means the segment has no quiet
+state to suppress, so listing it is inert.
+
+```sh
+sentinel always battery     # give battery a permanent slot
+sentinel always disk        # take disk's away again
+```
 
 ## Themes
 
@@ -151,6 +168,7 @@ is immediately selectable. See [CONTRIBUTING.md](CONTRIBUTING.md#adding-a-theme)
 | `sentinel preview [-t THEME] [-g GLYPHS] [--sim healthy\|alert\|both]` | render the real bar in this terminal |
 | `sentinel theme [NAME]` | list palettes with swatches, or apply one |
 | `sentinel toggle SEGMENT` | enable or disable a segment |
+| `sentinel always SEGMENT` | give a segment a resting state, or take it away |
 | `sentinel set KEY VALUE` | change any setting, validated |
 | `sentinel get [KEY]` | print current settings |
 | `sentinel apply` | regenerate artifacts and reload tmux |

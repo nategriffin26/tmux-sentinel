@@ -35,7 +35,7 @@ LF=$(printf '\nx')
 LF=${LF%x}
 TAB=$(printf '\t')
 
-OPTION_NAMES='theme position interval glyphs alerts_only segments windows clock_format session_max_length accent disk_warn_gb disk_crit_gb cpu_warn_pct cpu_crit_pct battery_warn_pct battery_crit_pct'
+OPTION_NAMES='theme position interval glyphs always segments windows clock_format session_max_length accent disk_warn_gb disk_crit_gb cpu_warn_pct cpu_crit_pct battery_warn_pct battery_crit_pct'
 SEGMENT_NAMES='thermal sleep_risk disk battery cpu memory multi_client clock'
 PALETTE_COLOURS='bg fg dim val sep accent prefix copy_mode warn alert peach info border active_border message_bg mode_bg'
 GLYPH_KEYS='accent sep thermal sleep disk battery_full battery_mid battery_low cpu memory clients'
@@ -172,6 +172,30 @@ parse_options_file() {
 	done <"$_file"
 }
 
+# True when an options file assigns @sentinel_<name>, whether or not the name is
+# still a recognised option. Used to notice a removed option that
+# parse_options_file deliberately ignores.
+file_sets_option() {
+	_file=$1
+	_want=$2
+	[ -f "$_file" ] || return 1
+	while IFS= read -r _line || [ -n "$_line" ]; do
+		_line=${_line%"$CR"}
+		trim "$_line"
+		_line=$trim_result
+		case $_line in
+		'' | '#'*) continue ;;
+		*@sentinel_*) ;;
+		*) continue ;;
+		esac
+		_rest=${_line#*@sentinel_}
+		if [ "${_rest%%[!a-z0-9_]*}" = "$_want" ]; then
+			return 0
+		fi
+	done <"$_file"
+	return 1
+}
+
 # Parse a `key=value` data file verbatim: no trimming and no unquoting, so a
 # padded value such as ` · ` survives byte for byte.
 parse_kv_file() {
@@ -220,6 +244,25 @@ if [ "$have_server" = 1 ]; then
 	done
 fi
 
+# -------------------------------------------------------- 2b. removed options
+# @sentinel_alerts_only was one boolean standing in for eight independent
+# decisions and was removed in 0.3.0. It is reported rather than translated:
+# quietly dropping a setting the user wrote is the "knob that lies" defect this
+# project has already fixed once. The live server is asked first because a
+# .tmux.conf setting only ever shows up there; options.conf is scanned too so
+# the warning still fires when generate.sh runs with no server.
+dead_set=0
+if [ "$have_server" = 1 ] &&
+	[ -n "$(tmux_cmd show-option -gqv @sentinel_alerts_only 2>/dev/null)" ]; then
+	dead_set=1
+fi
+if [ "$dead_set" = 0 ] && file_sets_option "$USER_OPTIONS" alerts_only; then
+	dead_set=1
+fi
+if [ "$dead_set" = 1 ]; then
+	notify '@sentinel_alerts_only was removed in 0.3.0 and is ignored. Use @sentinel_always: set -g @sentinel_always "disk,cpu,memory,clock" for the old "on", or list all eight segments for the old "off".'
+fi
+
 # ---------------------------------------------------------------- 3. validation
 # Domain enforcement is the security boundary. An out-of-domain value is
 # replaced by its default and reported; it never reaches a generated file.
@@ -265,6 +308,34 @@ check_enum() {
 	reject "$_ename" "must be one of: $*"
 }
 
+# A segment list is a comma-separated selection from the eight known names with
+# no spaces. Two options share this grammar: @sentinel_segments (which segments
+# exist at all) and @sentinel_always (which of them keep a visible resting
+# state). A user wanting nothing extra at rest writes a segment that has no
+# quiet state anyway, e.g. "cpu"; the empty list is not in the domain.
+check_segment_list() {
+	val_of "$1"
+	_lbad=0
+	case $v in
+	'' | *[!a-z_,]*) _lbad=1 ;;
+	,* | *, | *,,*) _lbad=1 ;;
+	esac
+	if [ "$_lbad" = 0 ]; then
+		_lifs=$IFS
+		IFS=,
+		for _ls in $v; do
+			case " $SEGMENT_NAMES " in
+			*" $_ls "*) ;;
+			*) _lbad=1 ;;
+			esac
+		done
+		IFS=$_lifs
+	fi
+	if [ "$_lbad" = 1 ]; then
+		reject "$1" "must be a comma-separated list, no spaces, drawn from: $SEGMENT_NAMES"
+	fi
+}
+
 # A data-file name must be a bare [a-z0-9-]+ stem resolving to a real file: no
 # separators and no dots, therefore no traversal out of themes/ or glyphs/.
 check_data_name() {
@@ -291,7 +362,6 @@ check_data_name theme themes palette
 check_enum glyphs nerd unicode ascii
 check_data_name glyphs glyphs glyphs
 check_enum position top bottom
-check_enum alerts_only on off
 check_enum windows hidden minimal tabs
 check_int interval 1 3600
 check_int session_max_length 1 64
@@ -316,27 +386,10 @@ if [ "$clock_bad" = 1 ]; then
 	reject clock_format 'must be 1..32 characters matching ^[%A-Za-z0-9 :/.,+-]{1,32}$'
 fi
 
-# segments: comma-separated list drawn from the eight known names, no spaces.
-val_of segments
-seg_bad=0
-case $v in
-'' | *[!a-z_,]*) seg_bad=1 ;;
-,* | *, | *,,*) seg_bad=1 ;;
-esac
-if [ "$seg_bad" = 0 ]; then
-	old_ifs=$IFS
-	IFS=,
-	for s in $v; do
-		case " $SEGMENT_NAMES " in
-		*" $s "*) ;;
-		*) seg_bad=1 ;;
-		esac
-	done
-	IFS=$old_ifs
-fi
-if [ "$seg_bad" = 1 ]; then
-	reject segments "must be a comma-separated list, no spaces, drawn from: $SEGMENT_NAMES"
-fi
+# @sentinel_segments decides which segments exist at all; @sentinel_always
+# decides which of those keep a visible resting state.
+check_segment_list segments
+check_segment_list always
 
 # accent: empty means "inherit the glyph set's mark"; otherwise 1..4 characters
 # with every tmux- and shell-significant character excluded.
@@ -391,18 +444,17 @@ if [ -z "$accent_mark" ]; then
 fi
 
 # ------------------------------------------------------------- 5. derived facts
-alerts_only=0
-if [ "$opt_alerts_only" = on ]; then
-	alerts_only=1
-fi
-
 for s in $SEGMENT_NAMES; do
 	eval "segon_$s=0"
+	eval "always_$s=0"
 done
 old_ifs=$IFS
 IFS=,
 for s in $opt_segments; do
 	eval "segon_$s=1"
+done
+for s in $opt_always; do
+	eval "always_$s=1"
 done
 IFS=$old_ifs
 
@@ -436,7 +488,14 @@ tmp_conf=$CONFIG_DIR/.sentinel.conf.$$
 	printf '# Theme: %s | Glyphs: %s\n' "$pal_name" "$gly_name"
 	emit version 1
 	printf '\n'
-	emit alerts_only "$alerts_only"
+	emit always_thermal "$always_thermal"
+	emit always_sleep_risk "$always_sleep_risk"
+	emit always_disk "$always_disk"
+	emit always_battery "$always_battery"
+	emit always_cpu "$always_cpu"
+	emit always_memory "$always_memory"
+	emit always_multi_client "$always_multi_client"
+	emit always_clock "$always_clock"
 	emit clock_format "$opt_clock_format"
 	printf '\n'
 	emit color_fg "$pal_fg"

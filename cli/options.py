@@ -22,7 +22,7 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Callable, Dict, Iterable, List, Optional, Sequence, Tuple
 
-VERSION = "0.2.0"
+VERSION = "0.3.0"
 
 REPO_ROOT = Path(__file__).resolve().parent.parent
 
@@ -52,10 +52,16 @@ SEGMENTS: Tuple[str, ...] = (
     "clock",
 )
 
+#: Segments with no quiet state: they render unconditionally, so their
+#: ``always_*`` state key is accepted but inert (CONTRACT SS3).
+INERT_ALWAYS: Tuple[str, ...] = ("cpu", "memory", "clock")
+
+#: Shipped resting-state set for ``@sentinel_always`` (CONTRACT SS5).
+ALWAYS_DEFAULT = "disk,cpu,memory,clock"
+
 GLYPH_MODES: Tuple[str, ...] = ("nerd", "unicode", "ascii")
 POSITIONS: Tuple[str, ...] = ("top", "bottom")
 WINDOW_MODES: Tuple[str, ...] = ("hidden", "minimal", "tabs")
-ONOFF: Tuple[str, ...] = ("on", "off")
 
 CLOCK_FORMAT_RE = re.compile(r"^[%A-Za-z0-9 :/.,+-]{1,32}$")
 ACCENT_FORBIDDEN = set('"\'\\$;#\n\r')
@@ -131,6 +137,17 @@ def _check_segments(value: str, _opts: "Options") -> bool:
     return all(p in SEGMENTS for p in parts) and len(set(parts)) == len(parts)
 
 
+def _check_always(value: str, opts: "Options") -> bool:
+    """Same list grammar as ``segments``, but the empty list is out of domain.
+
+    ``tmux show-option -gqv`` reports an *unset* option as the empty string, so
+    an empty ``@sentinel_always`` cannot mean "no segment has a resting state":
+    ``generate.sh`` restores the default instead.  Rejecting it here keeps the
+    knob from lying about what it did.
+    """
+    return value != "" and _check_segments(value, opts)
+
+
 def _check_clock_format(value: str, _opts: "Options") -> bool:
     return bool(CLOCK_FORMAT_RE.match(value))
 
@@ -173,8 +190,8 @@ SPECS: Tuple[Spec, ...] = (
          _const("10"), _no_choices),
     Spec("glyphs", "nerd|unicode|ascii", _enum_domain(GLYPH_MODES),
          _const("nerd"), lambda: list(GLYPH_MODES)),
-    Spec("alerts_only", "on|off", _enum_domain(ONOFF),
-         _const("on"), lambda: list(ONOFF)),
+    Spec("always", "non-empty comma list (no spaces) of: " + ",".join(SEGMENTS),
+         _check_always, _const(ALWAYS_DEFAULT), lambda: list(SEGMENTS)),
     Spec("segments", "comma list (no spaces) of: " + ",".join(SEGMENTS),
          _check_segments, _const(",".join(SEGMENTS)), lambda: list(SEGMENTS)),
     Spec("windows", "hidden|minimal|tabs", _enum_domain(WINDOW_MODES),
@@ -201,6 +218,17 @@ SPECS: Tuple[Spec, ...] = (
 
 SPEC_BY_KEY: Dict[str, Spec] = {s.key: s for s in SPECS}
 KEYS: Tuple[str, ...] = tuple(s.key for s in SPECS)
+
+# Options that existed in a shipped release and no longer do. Kept so an
+# upgrade reports them instead of either bricking the CLI (an unknown-option
+# abort) or dropping a user's setting without a word.
+REMOVED_OPTIONS: Dict[str, str] = {
+    "alerts_only": (
+        "use @sentinel_always to choose which segments stay visible "
+        f'when quiet (default "{ALWAYS_DEFAULT}"; the old "off" is every '
+        "segment named)"
+    ),
+}
 
 
 # --------------------------------------------------------------------------- #
@@ -300,6 +328,13 @@ def read_options_conf() -> Dict[str, str]:
                 "  refusing to guess; fix or delete the file."
             )
         key, value = m.group(1), m.group(2)
+        if key in REMOVED_OPTIONS:
+            # A removed option must not brick the CLI for anyone upgrading.
+            # Say so once and carry on; an option we never had still aborts,
+            # because that is a typo we must not silently discard.
+            warn(f"{OPTIONS_CONF}:{lineno}: @sentinel_{key} was removed in "
+                 f"{VERSION} and is ignored — {REMOVED_OPTIONS[key]}")
+            continue
         if key not in SPEC_BY_KEY:
             raise ConfigError(
                 f"{OPTIONS_CONF}:{lineno}: unknown option @sentinel_{key}"
@@ -373,8 +408,6 @@ def migrate_legacy_json() -> Optional[str]:
     put("position", data.get("position"))
     put("interval", data.get("interval"))
     put("glyphs", data.get("glyph_mode"))
-    if isinstance(data.get("alerts_only"), bool):
-        put("alerts_only", "on" if data["alerts_only"] else "off")
     segs = data.get("segments")
     if isinstance(segs, dict):
         enabled = [s for s in SEGMENTS if segs.get(s, True)]
@@ -469,15 +502,22 @@ class Options:
     def int_of(self, key: str) -> int:
         return int(self.get(key), 10)
 
-    def bool_of(self, key: str) -> bool:
-        return self.get(key) == "on"
+    def _name_list(self, key: str) -> List[str]:
+        raw = self.get(key)
+        return [] if raw == "" else raw.split(",")
 
     def segment_list(self) -> List[str]:
-        raw = self.get("segments")
-        return [] if raw == "" else raw.split(",")
+        return self._name_list("segments")
 
     def segment_enabled(self, name: str) -> bool:
         return name in self.segment_list()
+
+    def always_list(self) -> List[str]:
+        """Segments given a visible resting state (CONTRACT SS5)."""
+        return self._name_list("always")
+
+    def always_enabled(self, name: str) -> bool:
+        return name in self.always_list()
 
     def as_dict(self) -> Dict[str, str]:
         return dict(self._resolved)
@@ -514,21 +554,33 @@ class Options:
             if self._origin.get("accent") == "default":
                 self._resolved["accent"] = spec_accent.default(self)
 
-    def toggle_segment(self, name: str) -> bool:
+    def _toggle_in_list(self, key: str, name: str) -> bool:
+        """Flip ``name``'s membership of the comma list ``key``; return the new state."""
         if name not in SEGMENTS:
             raise OptionError(
                 f"unknown segment {name!r}; known: {', '.join(SEGMENTS)}"
             )
-        current = self.segment_list()
+        current = set(self._name_list(key))
         if name in current:
-            current.remove(name)
+            current.discard(name)
             enabled = False
         else:
-            current.append(name)
+            current.add(name)
             enabled = True
-        ordered = [s for s in SEGMENTS if s in current]
-        self.stage("segments", ",".join(ordered))
+        self.stage(key, ",".join(s for s in SEGMENTS if s in current))
         return enabled
+
+    def toggle_segment(self, name: str) -> bool:
+        return self._toggle_in_list("segments", name)
+
+    def toggle_always(self, name: str) -> bool:
+        if self.always_list() == [name]:
+            raise OptionError(
+                f"{name} is the last segment with a resting state; "
+                "@sentinel_always cannot be emptied (tmux reads an empty "
+                "option as unset, so the default would come back)"
+            )
+        return self._toggle_in_list("always", name)
 
     def persisted_snapshot(self) -> Dict[str, str]:
         """options.conf content after applying staged edits."""
@@ -707,8 +759,11 @@ def state_text(opts: Options) -> str:
     palette = themes.load_palette(opts.get("theme"))
     glyphs = themes.load_glyphs(opts.get("glyphs"))
 
-    lines = ["version=1", f"alerts_only={1 if opts.bool_of('alerts_only') else 0}",
-             f"clock_format={opts.get('clock_format')}"]
+    lines = ["version=1"]
+    resting = set(opts.always_list())
+    for seg in SEGMENTS:
+        lines.append(f"always_{seg}={1 if seg in resting else 0}")
+    lines.append(f"clock_format={opts.get('clock_format')}")
     for state_key, pal_key in _COLOR_STATE_KEYS:
         lines.append(f"{state_key}={palette[pal_key]}")
     enabled = set(opts.segment_list())

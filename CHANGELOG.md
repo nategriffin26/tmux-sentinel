@@ -2,6 +2,27 @@
 
 All notable changes to tmux-sentinel are documented here. This project follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/) and uses semantic versioning.
 
+## [0.3.0] - 2026-08-26
+
+Free disk space is on the bar by default, and every segment's resting visibility is now controlled individually.
+
+### Added
+
+- `@sentinel_always` — a comma-separated list of the segments that render even when they have nothing to report. Default `disk,cpu,memory,clock`. Each of the eight segments can be given or denied a resting state independently.
+- `sentinel always <segment>` flips one segment's resting state, mirroring the existing `sentinel toggle` for enablement, so turning one thing on does not mean retyping the whole list.
+- The `sleep_risk` segment gained a resting form: the idle-sleep timer when nothing is at risk, or `off` when idle sleep is disabled. Previously it could only appear as an alert.
+- The `multi_client` segment gained a resting form, so the client count can be shown permanently rather than only above one.
+- The customizer's old boolean "steady state" category is now a per-segment list; `cpu`, `memory` and `clock` are labelled inert rather than silently ignoring a toggle.
+
+### Changed
+
+- **Free disk space is shown by default.** It previously stayed hidden until it fell below `disk_warn_gb`, which meant the number you most want at a glance was the one you could not see.
+- `--simulate` now honours the configured `always_*` flags, so `sentinel preview` and the customizer show your configuration rather than a fixed idea of it.
+
+### Removed
+
+- `@sentinel_alerts_only`. One boolean stood in for eight independent decisions, and it forced disk to be either always hidden or shown alongside everything else. Both of its states remain expressible: the old `on` is the shipped default, the old `off` is every segment named in `@sentinel_always`. A still-set `@sentinel_alerts_only` is reported via `tmux display-message` rather than silently ignored, and the legacy `config.json` migration converts it.
+
 ## [0.2.0] - 2026-08-26
 
 Version 2 is a clean rewrite around one native renderer and validated tmux options.
@@ -38,4 +59,5 @@ Version 2 is a clean rewrite around one native renderer and validated tmux optio
 - `cli/config.py`
 - `cli/generator.py`
 
+[0.3.0]: https://github.com/nategriffin26/tmux-sentinel/releases/tag/v0.3.0
 [0.2.0]: https://github.com/nategriffin26/tmux-sentinel/releases/tag/v0.2.0

@@ -161,10 +161,13 @@ migrate_legacy_json() {
 		disk_warn_gb | disk_crit_gb | cpu_warn_pct | cpu_crit_pct) name=$key ;;
 		battery_warn_pct | battery_crit_pct) name=$key ;;
 		alerts_only)
-			name=alerts_only
+			# The 0.2.0 boolean, translated into its @sentinel_always
+			# equivalent: `true` is the shipped resting set, `false`
+			# gave every segment a resting state.
+			name=always
 			case $value in
-			true) value=on ;;
-			*) value=off ;;
+			true) value="disk,cpu,memory,clock" ;;
+			*) value="thermal,sleep_risk,disk,battery,cpu,memory,multi_client,clock" ;;
 			esac
 			;;
 		*) continue ;;

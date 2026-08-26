@@ -22,7 +22,7 @@ NL=${NL%x}
 
 # Reader defaults, per the state-file contract: a missing or partial state file
 # must never stop the bar from rendering.
-alerts_only=1
+always_disk=1
 clock_format=%H:%M
 color_fg='#cdd6f4'
 color_dim='#6c7086'
@@ -51,7 +51,7 @@ if [ -r "$STATE" ]; then
 		'' | '#'*) continue ;;
 		esac
 		case $key in
-		alerts_only) alerts_only=$value ;;
+		always_disk) always_disk=$value ;;
 		clock_format) clock_format=$value ;;
 		color_fg) color_fg=$value ;;
 		color_dim) color_dim=$value ;;
@@ -78,7 +78,7 @@ fi
 # Anything non-numeric in the state file falls back to the built-in default
 # rather than poisoning the arithmetic below.
 _v=
-for _n in alerts_only disk_warn_gb disk_crit_gb cpu_warn_pct cpu_crit_pct \
+for _n in always_disk disk_warn_gb disk_crit_gb cpu_warn_pct cpu_crit_pct \
 	seg_disk seg_cpu seg_memory seg_clock; do
 	eval "_v=\$$_n"
 	case $_v in
@@ -216,7 +216,7 @@ add() {
 }
 
 if [ "$seg_disk" = 1 ] && [ -n "$disk_gb" ]; then
-	if [ "$alerts_only" != 1 ] || [ "$disk_gb" -lt "$disk_warn_gb" ]; then
+	if [ "$always_disk" = 1 ] || [ "$disk_gb" -lt "$disk_warn_gb" ]; then
 		colour=$color_val
 		if [ "$disk_gb" -lt "$disk_warn_gb" ]; then colour=$color_warn; fi
 		if [ "$disk_gb" -lt "$disk_crit_gb" ]; then colour=$color_alert; fi

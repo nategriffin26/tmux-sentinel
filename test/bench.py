@@ -47,14 +47,23 @@ def time_once(argv: list[str], env: dict[str, str] | None = None) -> float:
 
 
 def recover_v1(into: Path) -> Path | None:
-    """Extract v0.1's shell status engine from git history."""
-    for ref in ("v0.1.0", "HEAD"):
-        result = subprocess.run(
-            ["git", "-C", str(REPO), "show", f"{ref}:{V1_PATH}"],
+    """Extract v0.1's shell status engine from git history.
+
+    The file was deleted in the v0.2.0 cutover, so look up the last commit
+    that still contained it rather than guessing at a ref.
+    """
+    log = subprocess.run(
+        ["git", "-C", str(REPO), "log", "--all", "--format=%H", "--", V1_PATH],
+        capture_output=True, text=True)
+    if log.returncode != 0:
+        return None
+    for sha in log.stdout.split():
+        blob = subprocess.run(
+            ["git", "-C", str(REPO), "show", f"{sha}:{V1_PATH}"],
             capture_output=True, text=True)
-        if result.returncode == 0 and result.stdout.strip():
+        if blob.returncode == 0 and blob.stdout.strip():
             script = into / "status-right.sh"
-            script.write_text(result.stdout, encoding="utf-8")
+            script.write_text(blob.stdout, encoding="utf-8")
             script.chmod(0o755)
             return script
     return None
