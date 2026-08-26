@@ -1,172 +1,252 @@
-# 󰌘 tmux-sentinel
+<div align="center">
 
-> **A sleek, native, alerts-only tmux status bar engine with an interactive live-preview TUI customizer.**
-> Stays whisper-quiet during healthy steady states; dynamically surfaces actionable alerts (thermal throttling, sleep risks, disk depletion, battery drops, high load) with quantitative metrics.
+# tmux-sentinel
 
-[![License: MIT](https://img.shields.io/badge/License-MIT-blue.svg)](LICENSE)
-[![tmux](https://img.shields.io/badge/tmux-3.0%2B-green.svg)](https://github.com/tmux/tmux)
-[![Zero Plugin Runtime](https://img.shields.io/badge/runtime-pure_native-orange.svg)](#architecture)
+**A quiet-by-default host health watchdog for your tmux status bar.**
 
----
+Stays silent while your machine is healthy. Surfaces thermal throttling, sleep
+risk, disk pressure, battery drain and CPU spikes the moment they matter —
+each with a number attached.
 
-## ⚡ Visual Preview
+[![CI](https://github.com/nategriffin26/tmux-sentinel/actions/workflows/ci.yml/badge.svg)](https://github.com/nategriffin26/tmux-sentinel/actions/workflows/ci.yml)
+[![License: MIT](https://img.shields.io/badge/license-MIT-blue.svg)](LICENSE)
+[![tmux 3.0+](https://img.shields.io/badge/tmux-3.0%2B-1bb91f.svg)](https://github.com/tmux/tmux)
+[![macOS · Linux](https://img.shields.io/badge/macOS-·_Linux-lightgrey.svg)](#platform-support)
 
-### 1. Healthy Steady State (Whisper-Quiet)
-```text
-▌ my-session                                          54G ·  22% · 󰍛 23.3G · 14:30
-```
-*Clean, uncluttered, focused. Shows only ambient host load and memory/swap.*
+![tmux-sentinel in action](assets/demo.gif)
 
-### 2. Actionable Alert State (Dynamically Surfaces Risks)
-```text
-▌ my-session            82% ·  10m ·  12G ·  18% ·  94% · 󰍛 24.1G ·  2 · 14:30
-```
-*Alert segments inject themselves only when attention is required:*
-- ` 82%` — CPU is thermally throttling (speed limit < 100%).
-- ` 10m` — System idle-sleep is armed without a wake lock (risks dropping remote mosh/ssh/agent sessions).
-- ` 12G` — Data volume critically low on disk space (< 15GB).
-- ` 18%` — Battery discharging rapidly (< 20%).
-- ` 94%` — CPU load spike (> 90%).
-- ` 2` — Multiple clients attached to session.
+</div>
 
 ---
 
-## 🚀 Interactive TUI Customizer
+## Why
 
-`tmux-sentinel` ships with a built-in terminal UI customizer (`sentinel`). It renders an **exact real-time ANSI preview** of your status bar as you tweak themes, glyphs, and segment toggles, and applies changes to tmux instantly.
+Most status bars are always shouting. A permanent CPU widget reading `4%` tells
+you nothing, costs a fork every tick, and trains you to ignore the bar — so the
+one time it reads `98%` you don't notice either.
 
-```bash
-sentinel
-```
+tmux-sentinel inverts that. A healthy machine shows **CPU, memory and the
+clock**. Everything else stays hidden until it crosses a threshold, so a
+segment appearing *is* the signal.
 
-```text
- 󰌘 TMUX-SENTINEL CUSTOMIZER                     Press [s] to Save & Reload | [q] to Exit
-╭─ Live Status Bar Preview ─────────────────────────────────────────────────────────────╮
-│ ▌ main                                         54G ·  24% · 󰍛 23.3G · 14:30       │
-│ [✔ Simulating Healthy State] Theme: Catppuccin Mocha (pos: top)                       │
-╰───────────────────────────────────────────────────────────────────────────────────────╯
+|                    | healthy                          | something wrong                                              |
+| ------------------ | -------------------------------- | ------------------------------------------------------------ |
+| what you see       | cpu · memory · clock             | throttling · sleep armed · disk low · battery draining · …    |
+| segments rendered  | 3                                | up to 8                                                       |
 
-  🎨 Color Theme             ● Catppuccin Mocha - Smooth dark palette with soothing pastel
-  🧩 Health Segments         ○ Tokyo Night - Vibrant night theme inspired by Tokyo neon
-  ⚡ Alerts-Only Mode        ○ Nord - Arctic, north-bluish clean aesthetic
-  🔤 Glyph Style             ○ Gruvbox Dark - Retro groove warmth with earthy organic tones
-  📐 Bar Position & Layout   ○ Rosé Pine - All natural pine, faux fur, and dusky floral rose
-  🗂️ Window Tabs Style       ○ Dracula - Famous dark gothic theme with vibrant saturated
-  🧪 Test Alert Simulation   ○ Solarized Dark - Precision color system designed for solar
-  💾 Save & Apply to Tmux    ○ One Dark - Atom and VS Code iconic balanced dark theme
-```
+It is also cheap enough to leave on. The whole bar is rendered by one native
+binary that makes **zero child processes** per tick.
 
----
+## Install
 
-## ✨ Features
+### tmux Plugin Manager (recommended)
 
-- **Alerts-Only Philosophy**: Eliminates perpetual widget clutter. Only surfaces metrics when thresholds are breached.
-- **Pure-Native Zero-Plugin Overhead**: No heavy ruby/python runtimes or plugin managers running inside statusbar ticks. Execution time is under 15ms.
-- **12 Curated Themes**: Catppuccin (Mocha, Macchiato, Frappé, Latte), Tokyo Night, Nord, Gruvbox Dark, Rosé Pine, Dracula, Solarized Dark, One Dark, Monokai Pro.
-- **Top / Bottom Placement**: Default top positioning frees the bottom of each terminal pane for AI agent prompts, shell integrations, or clean tiling.
-- **Mode Indicator Accent (`▌`)**: Left edge bar dynamically changes color (Blue: Normal, Red: Prefix active, Yellow: Copy-mode).
-- **High-Accuracy Mach CPU Tracker**: Includes a lightweight C utility (`mac-cpu-pct`) tracking exact delta CPU ticks between status intervals, with instant POSIX shell fallback.
-- **Nerd Font / Unicode / ASCII Glyph Sets**: Seamless support for both full Nerd Font icons and plain ASCII terminals.
-
----
-
-## 📦 Installation
-
-### Option 1: Automatic 1-Liner (Recommended)
-
-```bash
-git clone https://github.com/nategriffin26/tmux-sentinel.git ~/.config/tmux-sentinel/repo
-~/.config/tmux-sentinel/repo/bin/sentinel install
-```
-
-### Option 2: Tmux Plugin Manager (TPM)
-
-Add to your `~/.tmux.conf`:
 ```tmux
 set -g @plugin 'nategriffin26/tmux-sentinel'
 ```
-Then press `prefix + I` to fetch and activate.
 
-### Option 3: Manual Git Clone & Source
+Press <kbd>prefix</kbd> + <kbd>I</kbd>. Then build the native engine once:
 
-```bash
-git clone https://github.com/nategriffin26/tmux-sentinel.git ~/.tmux/plugins/tmux-sentinel
+```sh
 make -C ~/.tmux/plugins/tmux-sentinel
 ```
-Add to your `~/.tmux.conf`:
+
+Without that step the plugin still runs, in a reduced POSIX-shell mode that
+renders disk, CPU, memory and the clock. `sentinel doctor` will tell you which
+mode is active.
+
+### Manual
+
+```sh
+git clone https://github.com/nategriffin26/tmux-sentinel.git ~/.tmux/plugins/tmux-sentinel
+make -C ~/.tmux/plugins/tmux-sentinel install
+```
+
+`make install` builds the engine, symlinks `sentinel` into `~/.local/bin`, and
+adds one `source-file` line to your `~/.tmux.conf` (backing it up first).
+`make uninstall` reverses exactly that.
+
+## Configure
+
+Configuration lives in ordinary tmux options, so your whole setup stays in
+`.tmux.conf` and works with Nix, chezmoi, stow or a plain dotfiles repo.
+
 ```tmux
-run-shell ~/.tmux/plugins/tmux-sentinel/sentinel.tmux
+set -g @sentinel_theme          'tokyo-night'
+set -g @sentinel_position       'bottom'
+set -g @sentinel_glyphs         'ascii'      # no Nerd Font required
+set -g @sentinel_disk_warn_gb   '50'
+set -g @sentinel_segments       'disk,battery,cpu,memory,clock'
 ```
 
----
+<details>
+<summary><strong>All options</strong></summary>
 
-## 🛠️ CLI Commands
+| Option | Default | Domain |
+| --- | --- | --- |
+| `@sentinel_theme` | `catppuccin-mocha` | any stem in [`themes/`](themes) |
+| `@sentinel_position` | `top` | `top` · `bottom` |
+| `@sentinel_interval` | `10` | integer 1–3600 (seconds) |
+| `@sentinel_glyphs` | `nerd` | `nerd` · `unicode` · `ascii` |
+| `@sentinel_alerts_only` | `on` | `on` · `off` |
+| `@sentinel_segments` | all eight | comma list, no spaces |
+| `@sentinel_windows` | `hidden` | `hidden` · `minimal` · `tabs` |
+| `@sentinel_clock_format` | `%H:%M` | strftime, 1–32 chars |
+| `@sentinel_session_max_length` | `18` | integer 1–64 |
+| `@sentinel_accent` | *(glyph set default)* | 0–4 chars |
+| `@sentinel_disk_warn_gb` | `25` | integer 0–100000 |
+| `@sentinel_disk_crit_gb` | `15` | integer 0–100000 |
+| `@sentinel_cpu_warn_pct` | `70` | integer 0–100 |
+| `@sentinel_cpu_crit_pct` | `90` | integer 0–100 |
+| `@sentinel_battery_warn_pct` | `50` | integer 0–100 |
+| `@sentinel_battery_crit_pct` | `20` | integer 0–100 |
 
-`sentinel` can also be driven directly from scripts or shell commands:
+Every value is domain-validated before it reaches generated config. An
+out-of-range value falls back to its default and says so via
+`tmux display-message`. [`options.conf.default`](options.conf.default) documents
+each one in full and doubles as the reference.
 
-| Command | Action |
-|---|---|
-| `sentinel` or `sentinel customize` | Launch the interactive TUI customizer |
-| `sentinel preview` | Print a live ANSI status bar preview directly in the terminal |
-| `sentinel theme` | List all 12 available themes with color swatches |
-| `sentinel theme <name>` | Switch theme and reload tmux live (e.g. `sentinel theme tokyo-night`) |
-| `sentinel toggle <segment>` | Toggle segment on/off (`thermal`, `battery`, `cpu`, `disk`, `memory`, `sleep_risk`, `multi_client`, `clock`) |
-| `sentinel set position bottom` | Change bar position (`top` / `bottom`) |
-| `sentinel set glyph_mode ascii` | Switch icon set (`nerd` / `unicode` / `ascii`) |
-| `sentinel apply` | Re-generate configuration files and reload tmux clients |
-| `sentinel doctor` | Run system diagnostics and verify dependencies |
+</details>
 
----
+### Interactive customizer
 
-## 🎨 Themes Included
-
-| Theme Name | Description |
-|---|---|
-| `catppuccin-mocha` | Soothing dark pastel palette *(default)* |
-| `catppuccin-macchiato` | Medium-contrast Catppuccin variant |
-| `catppuccin-frappe` | Soft muted dark Catppuccin |
-| `catppuccin-latte` | Crisp high-legibility light theme |
-| `tokyo-night` | Neon-inspired Tokyo nightscape |
-| `nord` | Arctic icy blues and slate grays |
-| `gruvbox-dark` | Warm earthy retro groove tones |
-| `rose-pine` | Dusky floral roses and pine greens |
-| `dracula` | High-contrast saturated dark gothic palette |
-| `solarized-dark` | Precision solar-contrast color system |
-| `one-dark` | Iconic balanced dark theme |
-| `monokai-pro` | Vivid multi-accent modern charcoal theme |
-
----
-
-## 🧩 Dynamic Segments & Alert Thresholds
-
-| Segment | Icon | Trigger Condition | Thresholds |
-|---|---|---|---|
-| **Thermal Throttle** | `` | CPU speed limit capped by OS | Red `< 100%` |
-| **Sleep Risk** | `` | System idle sleep armed without wake assertion | Red if sleep armed (protects remote mosh/ssh/agents) |
-| **Disk Free** | `` | APFS Data container free space | Yellow `< 25GB`, Red `< 15GB` |
-| **Battery** | `` / `` | Discharging on battery power | Yellow `< 50%`, Red `< 20%` |
-| **CPU Usage** | `` | Real-time delta CPU tick load | Peach `≥ 70%`, Red `≥ 90%` |
-| **Memory / Swap** | `󰍛` | Swap usage & kernel VM pressure level | Yellow `Level 2`, Red `Level 4` |
-| **Multi-Client** | `` | Active clients attached to session | Cyan if `count > 1` |
-| **Clock** | — | System time | Bold foreground `%H:%M` |
-
----
-
-## 🏗️ Architecture
-
-```text
-~/.config/tmux-sentinel/
-├── config.json         <-- User settings managed by TUI / CLI
-├── sentinel.conf       <-- Static tmux settings (zero parsing latency)
-└── env.sh              <-- Pre-computed POSIX shell environment (<1ms load)
+```sh
+sentinel
 ```
 
-1. **Static Tmux Configuration (`sentinel.conf`)**: Sourced directly by tmux. Contains native styling, key indicators, and format strings.
-2. **Precomputed Shell Environment (`env.sh`)**: When settings or themes change, the CLI generates a 10-line POSIX environment file.
-3. **Single-Fork Status Script (`status-right.sh`)**: Executes in a single shell fork per status tick without invoking Python or external runtimes.
+A curses UI that previews the real bar — the same bytes the engine emits — while
+you cycle themes, glyph sets, segments and thresholds. Changes apply to the
+running tmux server immediately and persist to
+`~/.config/tmux-sentinel/options.conf`.
 
----
+## Segments
 
-## 📄 License
+| Segment | Appears when | Shows |
+| --- | --- | --- |
+| **Thermal** | the OS reports thermal pressure above nominal | `Fair` · `Serious` · `Critical` (Linux: `N°C`, alert at 80°C) |
+| **Sleep risk** | idle sleep is armed and nothing holds a wake assertion | minutes until sleep — the thing that kills remote `mosh`/`ssh`/agent sessions |
+| **Disk** | free space below `disk_warn_gb` | gigabytes free |
+| **Battery** | discharging | charge percent, icon and colour stepping down by threshold |
+| **CPU** | always | utilisation from real tick deltas, not load average |
+| **Memory** | always | swap in use, coloured by kernel memory-pressure level |
+| **Clients** | more than one client attached | client count |
+| **Clock** | always | your `clock_format` |
 
-MIT © 2026 [Nate Griffin](https://github.com/nategriffin26)
+Set `@sentinel_alerts_only 'off'` to render every enabled segment continuously.
+
+## Themes
+
+Twelve palettes, shown here in the alert state:
+
+![All twelve themes](assets/themes.png)
+
+Adding one is a data file, not code — drop a `themes/<name>.palette` in and it
+is immediately selectable. See [CONTRIBUTING.md](CONTRIBUTING.md#adding-a-theme).
+
+## CLI
+
+| Command | Does |
+| --- | --- |
+| `sentinel` | open the interactive customizer |
+| `sentinel preview [-t THEME] [-g GLYPHS] [--sim healthy\|alert\|both]` | render the real bar in this terminal |
+| `sentinel theme [NAME]` | list palettes with swatches, or apply one |
+| `sentinel toggle SEGMENT` | enable or disable a segment |
+| `sentinel set KEY VALUE` | change any setting, validated |
+| `sentinel get [KEY]` | print current settings |
+| `sentinel apply` | regenerate artifacts and reload tmux |
+| `sentinel doctor [--fix]` | diagnose, and optionally repair, the install |
+| `sentinel install` / `uninstall` | wire into / out of `~/.tmux.conf` |
+| `sentinel completion bash\|zsh` | emit shell completions |
+
+## Performance
+
+The bar is rendered by a single C binary that talks to Mach, IOKit and
+`statfs` directly. No `pmset`, no `df`, no `awk`, no subshells.
+
+| | v0.1 (shell) | v0.2 (native) |
+| --- | ---: | ---: |
+| median per tick | 44.6 ms | **5.4 ms** |
+| fastest observed | 40.3 ms | **4.6 ms** |
+| child processes per tick | 21–28 | **0** |
+
+Measured on an M3 Pro with an interleaved A/B so both implementations saw the
+same system load, and stable across repeated runs. Reproduce it with
+`make bench`, which recovers the v0.1 engine from git history and re-races it.
+About 1.7 ms of the remaining time is process-spawn cost that any tmux `#()`
+command pays, so the engine's own work is roughly 3.7 ms.
+
+Concurrency is handled properly: CPU tick deltas live in a locked, timestamped
+record in a validated per-user runtime directory, so N attached clients and a
+preview running at the same time all read a consistent value instead of racing.
+
+## Platform support
+
+| | macOS | Linux |
+| --- | --- | --- |
+| CPU, memory, disk, clock, clients | ✅ | ✅ |
+| Battery | ✅ IOKit | ✅ aggregates every `/sys/class/power_supply/*` battery |
+| Thermal | ✅ thermal-pressure notifications | ✅ hottest CPU/package sensor |
+| Sleep risk | ✅ IOPM assertions | ❌ not implemented |
+
+## Architecture
+
+```mermaid
+flowchart LR
+    A[".tmux.conf<br/>@sentinel_*"] --> B["sentinel.tmux<br/>TPM entrypoint"]
+    B --> C["scripts/generate.sh<br/>validate + generate"]
+    C --> D["sentinel.state"]
+    C --> E["sentinel.conf"]
+    E --> F["tmux"]
+    D --> G["bin/sentinel-status"]
+    F -- "#() every tick" --> G
+    G -- "status-right" --> F
+```
+
+Two rules keep it honest:
+
+1. **The bar has exactly one renderer.** `bin/sentinel-status` produces every
+   segment, and `sentinel preview` and the TUI display *its* output rather than
+   reimplementing the layout. The predecessor had four implementations of one
+   bar and they disagreed in eleven measurable ways.
+2. **There is exactly one generator.** `scripts/generate.sh` is the only thing
+   that writes tmux config, and the only place user input is validated. Nothing
+   else may interpolate a user value into `sentinel.conf`.
+
+No Python is required for the status bar to work; it powers only the CLI and
+the customizer.
+
+## Development
+
+```sh
+make            # build the engine
+make test       # 65 tests: engine contract, injection, tmux validity, concurrency
+make lint       # shellcheck every script
+make bench      # the A/B in the table above
+```
+
+Tests use a private tmux socket and a scratch `XDG_CONFIG_HOME`, so they never
+touch your session or your config.
+
+[docs/CONTRACT.md](docs/CONTRACT.md) is the design contract: the state-file
+grammar, the engine CLI, the segment rendering rules and the option domains.
+Read it before adding a segment or an option.
+[CONTRIBUTING.md](CONTRIBUTING.md) covers the day-to-day workflow.
+
+```sh
+sentinel doctor          # what is broken, and why
+./assets/theme-grid.sh   # every bundled palette, side by side
+```
+
+## Credits
+
+Palettes adapted from [Catppuccin](https://github.com/catppuccin),
+[Tokyo Night](https://github.com/enkia/tokyo-night-vscode-theme),
+[Nord](https://www.nordtheme.com), [Gruvbox](https://github.com/morhetz/gruvbox),
+[Rosé Pine](https://rosepinetheme.com), [Dracula](https://draculatheme.com),
+[Solarized](https://ethanschoonover.com/solarized),
+[One Dark](https://github.com/atom/atom) and
+[Monokai Pro](https://monokai.pro).
+
+## License
+
+MIT © [Nate Griffin](https://github.com/nategriffin26) — see [LICENSE](LICENSE).

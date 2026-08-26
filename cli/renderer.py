@@ -1,203 +1,405 @@
-"""ANSI & terminal renderer for live tmux-sentinel preview."""
+"""Converter from the engine's tmux-format output to ANSI / curses runs.
+
+There is no Python reimplementation of the status bar.  The right-hand segment
+group is produced by ``bin/sentinel-status`` and this module only translates it
+for terminal display (``sentinel preview``) or curses attribute runs (the TUI).
+"""
+
+from __future__ import annotations
 
 import re
-import shutil
-from typing import Dict, Any, Tuple
-from .themes import THEMES, GLYPH_SETS
+import unicodedata
+from dataclasses import dataclass
+from typing import Dict, List, Optional, Tuple
+
+from . import options as opt_mod
+from . import themes
+
+# --------------------------------------------------------------------------- #
+# Width
+# --------------------------------------------------------------------------- #
+
+_ZERO_WIDTH = frozenset("\u200b\u200c\u200d\u2060\ufeff\ufe0e\ufe0f")
+
+
+def display_width(text: str) -> int:
+    """Terminal column count of ``text``.
+
+    ``len()`` is wrong for the data this project renders: the unicode glyph set
+    contains wide characters and both glyph sets contain variation selectors and
+    combining marks.  East-Asian ``W``/``F`` count as two columns; combining
+    marks, zero-width characters and U+FE0F count as zero.
+    """
+    width = 0
+    for ch in text:
+        if ch in _ZERO_WIDTH or unicodedata.combining(ch):
+            continue
+        cat = unicodedata.category(ch)
+        if cat in ("Mn", "Me", "Cf"):
+            continue
+        if cat == "Cc":
+            continue
+        width += 2 if unicodedata.east_asian_width(ch) in ("W", "F") else 1
+    return width
+
+
+def truncate_to_width(text: str, width: int) -> str:
+    """Longest prefix of ``text`` whose display width is <= ``width``."""
+    if width <= 0:
+        return ""
+    total = 0
+    for idx, ch in enumerate(text):
+        step = display_width(ch)
+        if total + step > width:
+            return text[:idx]
+        total += step
+    return text
+
+
+def pad_to_width(text: str, width: int) -> str:
+    """Pad or truncate ``text`` to exactly ``width`` display columns."""
+    clipped = truncate_to_width(text, width)
+    return clipped + " " * (width - display_width(clipped))
+
+
+# --------------------------------------------------------------------------- #
+# Colour
+# --------------------------------------------------------------------------- #
 
 
 def hex_to_rgb(hex_str: str) -> Tuple[int, int, int]:
-    """Convert hex string '#rrggbb' to (r, g, b) tuple."""
-    hex_clean = hex_str.lstrip("#")
-    if len(hex_clean) == 3:
-        hex_clean = "".join([c * 2 for c in hex_clean])
-    if len(hex_clean) != 6:
+    """Convert ``#rgb`` or ``#rrggbb`` to an (r, g, b) triple."""
+    clean = hex_str.lstrip("#")
+    if len(clean) == 3:
+        clean = "".join(c * 2 for c in clean)
+    if len(clean) != 6:
         return (200, 200, 200)
-    return (int(hex_clean[0:2], 16), int(hex_clean[2:4], 16), int(hex_clean[4:6], 16))
+    try:
+        return (int(clean[0:2], 16), int(clean[2:4], 16), int(clean[4:6], 16))
+    except ValueError:
+        return (200, 200, 200)
 
 
-def tmux_tag_to_ansi(tag: str) -> str:
-    """Convert a tmux #[...] style tag to ANSI escape sequence."""
-    inner = tag[2:-1]  # strip #[ and ]
-    codes = []
-    for part in inner.split(","):
+#: tmux's named colours, as approximate sRGB.
+NAMED_COLORS: Dict[str, Tuple[int, int, int]] = {
+    "black": (0, 0, 0),
+    "red": (205, 0, 0),
+    "green": (0, 205, 0),
+    "yellow": (205, 205, 0),
+    "blue": (0, 0, 238),
+    "magenta": (205, 0, 205),
+    "cyan": (0, 205, 205),
+    "white": (229, 229, 229),
+    "brightblack": (127, 127, 127),
+    "brightred": (255, 0, 0),
+    "brightgreen": (0, 255, 0),
+    "brightyellow": (255, 255, 0),
+    "brightblue": (92, 92, 255),
+    "brightmagenta": (255, 0, 255),
+    "brightcyan": (0, 255, 255),
+    "brightwhite": (255, 255, 255),
+}
+
+_COLOUR_INDEX_RE = re.compile(r"^colou?r(\d+)$")
+
+
+def color_to_rgb(value: str) -> Optional[Tuple[int, int, int]]:
+    """Resolve a tmux colour spec to RGB, or None for ``default``/unknown."""
+    if not value or value == "default":
+        return None
+    if value.startswith("#"):
+        return hex_to_rgb(value)
+    lowered = value.lower()
+    if lowered in NAMED_COLORS:
+        return NAMED_COLORS[lowered]
+    m = _COLOUR_INDEX_RE.match(lowered)
+    if m:
+        return _xterm256_to_rgb(int(m.group(1)))
+    return None
+
+
+def _xterm256_to_rgb(index: int) -> Tuple[int, int, int]:
+    if index < 16:
+        order = list(NAMED_COLORS.values())
+        return order[index] if index < len(order) else (200, 200, 200)
+    if index < 232:
+        index -= 16
+        levels = (0, 95, 135, 175, 215, 255)
+        return (levels[index // 36], levels[(index // 6) % 6], levels[index % 6])
+    grey = 8 + (index - 232) * 10
+    return (grey, grey, grey)
+
+
+# --------------------------------------------------------------------------- #
+# tmux format parsing
+# --------------------------------------------------------------------------- #
+
+
+@dataclass
+class Style:
+    fg: Optional[str] = None
+    bg: Optional[str] = None
+    bold: bool = False
+
+    def copy(self) -> "Style":
+        return Style(self.fg, self.bg, self.bold)
+
+
+@dataclass
+class Span:
+    text: str
+    style: Style
+
+
+_TAG_RE = re.compile(r"#\[([^\]]*)\]")
+
+
+def _apply_tag(style: Style, body: str) -> Style:
+    new = style.copy()
+    for part in body.split(","):
         part = part.strip()
         if not part:
             continue
         if part.startswith("fg="):
-            val = part[3:]
-            if val == "default":
-                codes.append("\033[39m")
-            elif val.startswith("#"):
-                r, g, b = hex_to_rgb(val)
-                codes.append(f"\033[38;2;{r};{g};{b}m")
+            new.fg = part[3:]
         elif part.startswith("bg="):
-            val = part[3:]
-            if val == "default":
-                codes.append("\033[49m")
-            elif val.startswith("#"):
-                r, g, b = hex_to_rgb(val)
-                codes.append(f"\033[48;2;{r};{g};{b}m")
-        elif part == "bold":
-            codes.append("\033[1m")
+            new.bg = part[3:]
+        elif part in ("bold", "bright"):
+            new.bold = True
+        elif part in ("nobold", "nobright"):
+            new.bold = False
         elif part in ("default", "none"):
-            codes.append("\033[0m")
-    return "".join(codes)
+            new = Style()
+    return new
 
 
-def tmux_to_ansi(tmux_str: str) -> str:
-    """Convert a tmux-formatted string containing #[...] into ANSI."""
-    # Replace #[...] with ANSI codes
-    pattern = re.compile(r"#\[[^\]]*\]")
-    return pattern.sub(lambda m: tmux_tag_to_ansi(m.group(0)), tmux_str) + "\033[0m"
+def parse_tmux(text: str) -> List[Span]:
+    """Split a tmux-format string into styled spans.  ``##`` unescapes to ``#``."""
+    spans: List[Span] = []
+    style = Style()
+    buffer: List[str] = []
+    i = 0
+    length = len(text)
+    while i < length:
+        ch = text[i]
+        if ch == "#" and i + 1 < length:
+            nxt = text[i + 1]
+            if nxt == "[":
+                m = _TAG_RE.match(text, i)
+                if m:
+                    if buffer:
+                        spans.append(Span("".join(buffer), style))
+                        buffer = []
+                    style = _apply_tag(style, m.group(1))
+                    i = m.end()
+                    continue
+            elif nxt == "#":
+                buffer.append("#")
+                i += 2
+                continue
+        buffer.append(ch)
+        i += 1
+    if buffer:
+        spans.append(Span("".join(buffer), style))
+    return spans
+
+
+def plain_text(text: str) -> str:
+    """Strip tmux ``#[...]`` markup, leaving the printable characters."""
+    return "".join(span.text for span in parse_tmux(text))
+
+
+def spans_to_ansi(spans: List[Span], default_bg: Optional[str] = None) -> str:
+    """Render spans as ANSI.  ``default_bg`` backs spans that set no background."""
+    bg_fallback = "49"
+    if default_bg and default_bg != "default":
+        rgb = color_to_rgb(default_bg)
+        if rgb is not None:
+            bg_fallback = f"48;2;{rgb[0]};{rgb[1]};{rgb[2]}"
+    out: List[str] = []
+    for span in spans:
+        codes: List[str] = []
+        if span.style.fg is None or span.style.fg == "default":
+            codes.append("39")
+        else:
+            rgb = color_to_rgb(span.style.fg)
+            codes.append("39" if rgb is None else f"38;2;{rgb[0]};{rgb[1]};{rgb[2]}")
+        if span.style.bg is None or span.style.bg == "default":
+            codes.append(bg_fallback)
+        else:
+            rgb = color_to_rgb(span.style.bg)
+            codes.append(
+                bg_fallback if rgb is None else f"48;2;{rgb[0]};{rgb[1]};{rgb[2]}"
+            )
+        codes.append("1" if span.style.bold else "22")
+        out.append("\033[" + ";".join(codes) + "m" + span.text)
+    return "".join(out)
+
+
+def tmux_to_ansi(tmux_str: str, default_bg: Optional[str] = None) -> str:
+    """Convert a tmux-format string containing ``#[...]`` into ANSI."""
+    return spans_to_ansi(parse_tmux(tmux_str), default_bg) + "\033[0m"
+
+
+_ANSI_RE = re.compile(r"\x1B(?:[@-Z\\-_]|\[[0-?]*[ -/]*[@-~])")
 
 
 def strip_ansi(text: str) -> str:
-    """Remove ANSI escape sequences to get printable character width."""
-    ansi_escape = re.compile(r"\x1B(?:[@-Z\\-_]|\[[0-?]*[ -/]*[@-~])")
-    return ansi_escape.sub("", text)
+    """Remove ANSI escape sequences, leaving the printable characters."""
+    return _ANSI_RE.sub("", text)
 
 
-def render_preview_bar(cfg: Dict[str, Any], width: int = 80, session_name: str = "main", sim_state: Dict[str, Any] = None) -> str:
-    """Render a full simulated status bar line formatted with ANSI truecolor."""
-    theme_name = cfg.get("theme", "catppuccin-mocha")
-    theme = THEMES.get(theme_name, THEMES["catppuccin-mocha"])
+# --------------------------------------------------------------------------- #
+# Engine output
+# --------------------------------------------------------------------------- #
 
-    glyph_mode = cfg.get("glyph_mode", "nerd")
-    glyphs = GLYPH_SETS.get(glyph_mode, GLYPH_SETS["nerd"])
+SIM_STATES = ("healthy", "alert")
 
-    segments = cfg.get("segments", {})
-    left_cfg = cfg.get("left", {})
-    windows_cfg = cfg.get("windows", {})
-    thresholds = cfg.get("thresholds", {})
-    alerts_only = cfg.get("alerts_only", True)
 
-    if sim_state is None:
-        sim_state = {
-            "thermal": 100,
-            "sleep_risk": False,
-            "disk_gb": 54,
-            "batt_pct": 92,
-            "batt_discharging": False,
-            "cpu_pct": 24,
-            "swap_gb": "23.3G",
-            "pressure_level": 1,
-            "multi_client": 1,
-            "time_str": "14:28",
-            "prefix_active": False,
-            "in_copy_mode": False,
-        }
+def engine_segments(opts: "opt_mod.Options", sim: str) -> str:
+    """The right-hand segment group, rendered by ``bin/sentinel-status``.
 
-    # Accent symbol & mode color
-    accent_color = theme["accent"]
-    if sim_state.get("prefix_active"):
-        accent_color = theme["prefix"]
-    elif sim_state.get("in_copy_mode"):
-        accent_color = theme["copy_mode"]
+    Raises :class:`options.EngineMissing` with an actionable message when the
+    binary has not been built.  There is deliberately no Python fallback.
+    """
+    if sim not in SIM_STATES:
+        raise ValueError(f"sim must be one of {SIM_STATES}, got {sim!r}")
+    state_path = opt_mod.write_temp_state(opts)
+    try:
+        proc = opt_mod.run_engine(
+            ["--simulate", sim, "--state", str(state_path)]
+        )
+    finally:
+        try:
+            state_path.unlink()
+        except OSError:
+            pass
+    if proc.returncode != 0:
+        detail = proc.stderr.strip() or f"exit {proc.returncode}"
+        raise RuntimeError(f"sentinel-status --simulate {sim} failed: {detail}")
+    return proc.stdout.rstrip("\n")
 
-    accent_symbol = left_cfg.get("accent_symbol", glyphs["accent"])
-    max_len = left_cfg.get("max_session_length", 18)
-    disp_session = session_name[:max_len]
 
-    left_str = f"#[fg={accent_color}]{accent_symbol}#[fg={theme['fg']},bold] {disp_session} #[default]"
+def separator_token(opts: "opt_mod.Options") -> str:
+    """The exact structural separator the engine places between segments."""
+    palette = themes.load_palette(opts.get("theme"))
+    glyphs = themes.load_glyphs(opts.get("glyphs"))
+    return f"#[fg={palette['sep']}]{glyphs['sep']}"
 
-    # Window tabs (if not hidden)
-    win_mode = windows_cfg.get("mode", "hidden")
-    if win_mode == "minimal":
-        left_str += f"#[fg={theme['accent']},bold] 1:main #[fg={theme['sep']}]|#[fg={theme['dim']}] 2:sh #[default]"
-    elif win_mode == "tabs":
-        left_str += f"#[fg={theme['bg']},bg={theme['accent']},bold] 1 #[fg={theme['fg']},bg={theme['mode_bg']}] main #[fg={theme['dim']},bg={theme['border']}] 2 #[fg={theme['fg']},bg={theme['message_bg']}] sh #[default]"
 
-    # Right segments
-    sep = f"#[fg={theme['sep']}]{glyphs['sep']}"
-    right_parts = []
+def split_segments(rendered: str, separator: str) -> List[str]:
+    """Split engine output back into its rendered segments."""
+    if not rendered:
+        return []
+    if not separator:
+        return [rendered]
+    return rendered.split(separator)
 
-    # 1. Thermal
-    if segments.get("thermal", True):
-        t_val = sim_state.get("thermal", 100)
-        if t_val < 100:
-            right_parts.append(f"#[fg={theme['alert']}]{glyphs['thermal']} {t_val}%")
-        elif not alerts_only:
-            right_parts.append(f"#[fg={theme['dim']}]{glyphs['thermal']} #[fg={theme['val']}]{t_val}%")
 
-    # 2. Sleep risk
-    if segments.get("sleep_risk", True) and sim_state.get("sleep_risk", False):
-        right_parts.append(f"#[fg={theme['alert']}]{glyphs['sleep']} 10m")
+def render_left(opts: "opt_mod.Options", session_name: str) -> str:
+    """The tmux ``status-left`` equivalent, for preview composition only."""
+    palette = themes.load_palette(opts.get("theme"))
+    accent = opts.get("accent")
+    session = truncate_to_width(session_name, opts.int_of("session_max_length"))
+    left = (
+        f"#[fg={palette['accent']}]{accent}"
+        f"#[fg={palette['fg']},bold] {session} #[default]"
+    )
+    mode = opts.get("windows")
+    if mode == "minimal":
+        left += (
+            f"#[fg={palette['accent']},bold]1:dev"
+            f"#[fg={palette['sep']}] | #[fg={palette['dim']}]2:sh #[default]"
+        )
+    elif mode == "tabs":
+        left += (
+            f"#[fg={palette['bg']},bg={palette['accent']},bold] 1 dev "
+            f"#[fg={palette['fg']},bg={palette['mode_bg']}] 2 sh #[default]"
+        )
+    return left
 
-    # 3. Disk
-    if segments.get("disk", True):
-        d_val = sim_state.get("disk_gb", 54)
-        c = theme["val"]
-        if d_val < thresholds.get("disk_crit_gb", 15):
-            c = theme["alert"]
-        elif d_val < thresholds.get("disk_warn_gb", 25):
-            c = theme["warn"]
-        if not alerts_only or d_val < thresholds.get("disk_warn_gb", 25):
-            right_parts.append(f"#[fg={theme['dim']}]{glyphs['disk']} #[fg={c}]{d_val}G")
-        else:
-            right_parts.append(f"#[fg={theme['dim']}]{glyphs['disk']} #[fg={theme['val']}]{d_val}G")
 
-    # 4. Battery
-    if segments.get("battery", True):
-        b_pct = sim_state.get("batt_pct", 92)
-        discharging = sim_state.get("batt_discharging", False)
-        if discharging:
-            c = theme["warn"]
-            icon = glyphs["battery_full"]
-            if b_pct < thresholds.get("battery_crit_pct", 20):
-                c = theme["alert"]
-                icon = glyphs["battery_low"]
-            elif b_pct < thresholds.get("battery_warn_pct", 50):
-                c = theme["peach"]
-                icon = glyphs["battery_mid"]
-            right_parts.append(f"#[fg={c}]{icon} {b_pct}%")
-        elif not alerts_only:
-            right_parts.append(f"#[fg={theme['dim']}]{glyphs['battery_full']} #[fg={theme['val']}]{b_pct}%")
+def compose_bar(
+    opts: "opt_mod.Options",
+    width: int,
+    sim: str = "healthy",
+    session_name: str = "main",
+) -> str:
+    """Compose a full-width bar in tmux format: left + padding + engine segments.
 
-    # 5. CPU
-    if segments.get("cpu", True):
-        cpu_val = sim_state.get("cpu_pct", 24)
-        c = theme["val"]
-        if cpu_val >= thresholds.get("cpu_crit_pct", 90):
-            c = theme["alert"]
-        elif cpu_val >= thresholds.get("cpu_warn_pct", 70):
-            c = theme["peach"]
-        right_parts.append(f"#[fg={theme['dim']}]{glyphs['cpu']} #[fg={c}]{cpu_val:2d}%")
+    The result is exactly ``width`` display columns.  When the content does not
+    fit, whole segments are dropped from the left of the segment group rather
+    than emitting an over-wide line.
+    """
+    right = engine_segments(opts, sim)
+    separator = separator_token(opts)
+    segments = split_segments(right, separator)
+    left = render_left(opts, session_name)
 
-    # 6. Memory / Swap
-    if segments.get("memory", True):
-        swap_str = sim_state.get("swap_gb", "23.3G")
-        plvl = sim_state.get("pressure_level", 1)
-        c = theme["val"]
-        if plvl >= 4:
-            c = theme["alert"]
-        elif plvl >= 2:
-            c = theme["warn"]
-        right_parts.append(f"#[fg={theme['dim']}]{glyphs['memory']} #[fg={c}]{swap_str}")
+    left_w = display_width(plain_text(left))
+    sep_w = display_width(plain_text(separator))
 
-    # 7. Multi-client
-    if segments.get("multi_client", True) and sim_state.get("multi_client", 1) > 1:
-        right_parts.append(f"#[fg={theme['info']}]{glyphs['clients']} {sim_state['multi_client']}")
+    def group_width(parts: List[str]) -> int:
+        if not parts:
+            return 0
+        return sum(display_width(plain_text(p)) for p in parts) + sep_w * (
+            len(parts) - 1
+        )
 
-    # 8. Clock
-    if segments.get("clock", True):
-        right_parts.append(f"#[fg={theme['fg']},bold]{sim_state.get('time_str', '14:28')} ")
+    # Reserve one column of padding between the halves.
+    while segments and left_w + 1 + group_width(segments) > width:
+        segments.pop(0)
 
-    right_str = sep.join(right_parts)
+    right_out = separator.join(segments)
+    right_w = group_width(segments)
 
-    left_ansi = tmux_to_ansi(left_str)
-    right_ansi = tmux_to_ansi(right_str)
+    if left_w + right_w > width:
+        # Nothing but the left half remains and it is still too wide.
+        left = _truncate_tmux(left, max(width - right_w, 0))
+        left_w = display_width(plain_text(left))
 
-    left_len = len(strip_ansi(left_ansi))
-    right_len = len(strip_ansi(right_ansi))
+    pad = width - left_w - right_w
+    if pad < 0:
+        pad = 0
+    return left + "#[default]" + " " * pad + right_out
 
-    padding = width - left_len - right_len
-    if padding < 1:
-        padding = 1
 
-    bg_style = "\033[49m"  # default transparent bg
-    if theme["bg"] != "default":
-        r, g, b = hex_to_rgb(theme["bg"])
-        bg_style = f"\033[48;2;{r};{g};{b}m"
+def _truncate_tmux(tmux_str: str, width: int) -> str:
+    """Clip a tmux-format string to ``width`` display columns, keeping markup."""
+    out: List[str] = []
+    used = 0
+    for span in parse_tmux(tmux_str):
+        style = span.style
+        tag_parts = []
+        if style.fg:
+            tag_parts.append(f"fg={style.fg}")
+        if style.bg:
+            tag_parts.append(f"bg={style.bg}")
+        if style.bold:
+            tag_parts.append("bold")
+        tag = f"#[{','.join(tag_parts)}]" if tag_parts else "#[default]"
+        remaining = width - used
+        if remaining <= 0:
+            break
+        clipped = truncate_to_width(span.text, remaining)
+        if clipped:
+            out.append(tag + clipped)
+            used += display_width(clipped)
+    return "".join(out)
 
-    return f"{bg_style}{left_ansi}{' ' * padding}{right_ansi}\033[0m"
+
+def render_preview_bar(
+    opts: "opt_mod.Options",
+    width: int = 80,
+    sim: str = "healthy",
+    session_name: str = "main",
+) -> str:
+    """ANSI rendering of the real bar, exactly ``width`` display columns wide."""
+    bar = compose_bar(opts, width, sim=sim, session_name=session_name)
+    palette = themes.load_palette(opts.get("theme"))
+    return tmux_to_ansi(bar, default_bg=palette["bg"])
+
+
+def preview_width(rendered_ansi: str) -> int:
+    """Measured display width of an ANSI-rendered bar."""
+    return display_width(strip_ansi(rendered_ansi))

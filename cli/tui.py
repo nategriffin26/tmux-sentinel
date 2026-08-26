@@ -1,546 +1,749 @@
-"""Interactive Curses TUI Customizer with real-time status bar preview."""
+"""Interactive curses customizer.
+
+The preview inside this TUI is the output of ``bin/sentinel-status --simulate``,
+converted to curses attribute runs, so it cannot disagree with the real bar.
+Every mutation goes through :mod:`cli.options`, keeping tmux options the single
+source of truth.
+"""
+
+from __future__ import annotations
 
 import curses
 import os
-import subprocess
-import time
-from typing import Dict, Any, List
+import sys
+from dataclasses import dataclass
+from typing import Callable, Dict, List, Optional, Tuple
 
-from .config import load_config, save_config
-from .themes import THEMES, GLYPH_SETS
-from .generator import generate_all
-from .renderer import hex_to_rgb
+from . import options as O
+from . import renderer
+from . import themes
+from .renderer import Span, Style, display_width, pad_to_width, truncate_to_width
+
+MIN_WIDTH = 80
+MIN_HEIGHT = 24
+
+# Chrome colour pairs; dynamic preview pairs are allocated above these.
+P_ACCENT = 1
+P_OK = 2
+P_WARN = 3
+P_ALERT = 4
+P_SELECT = 5
+P_DIM = 6
+P_TEXT = 7
+CHROME_PAIRS = 8
+
+
+# --------------------------------------------------------------------------- #
+# Colour allocation
+# --------------------------------------------------------------------------- #
+
+#: curses colour numbers 0-15, in the order of the ANSI palette.
+_ANSI16 = list(renderer.NAMED_COLORS.values())
+
+
+def _nearest(rgb: Tuple[int, int, int], table: List[Tuple[int, int, int]]) -> int:
+    best, best_d = 0, None
+    for idx, cand in enumerate(table):
+        d = ((rgb[0] - cand[0]) ** 2 + (rgb[1] - cand[1]) ** 2
+             + (rgb[2] - cand[2]) ** 2)
+        if best_d is None or d < best_d:
+            best, best_d = idx, d
+    return best
+
+
+def _xterm256_nearest(rgb: Tuple[int, int, int]) -> int:
+    levels = (0, 95, 135, 175, 215, 255)
+    cube = tuple(_nearest((c, c, c), [(l, l, l) for l in levels]) for c in rgb)
+    cube_idx = 16 + 36 * cube[0] + 6 * cube[1] + cube[2]
+    cube_rgb = (levels[cube[0]], levels[cube[1]], levels[cube[2]])
+    grey_val = (rgb[0] + rgb[1] + rgb[2]) // 3
+    grey_step = min(23, max(0, (grey_val - 8) // 10))
+    grey_rgb = (8 + grey_step * 10,) * 3
+    d_cube = sum((a - b) ** 2 for a, b in zip(rgb, cube_rgb))
+    d_grey = sum((a - b) ** 2 for a, b in zip(rgb, grey_rgb))
+    return cube_idx if d_cube <= d_grey else 232 + grey_step
+
+
+class ColorAllocator:
+    """Maps tmux colour specs onto curses colours and pairs, on demand.
+
+    Truecolor is reproduced with ``init_color`` when the terminal allows
+    redefinition; otherwise the nearest xterm-256 or ANSI-16 colour is used.  A
+    terminal reporting ``COLORS == 8`` still works, it just looks coarse.
+    """
+
+    def __init__(self) -> None:
+        try:
+            curses.start_color()
+        except curses.error:
+            pass
+        self.has_color = curses.has_colors()
+        try:
+            curses.use_default_colors()
+            self.default_bg_ok = True
+        except curses.error:
+            self.default_bg_ok = False
+        self.colors = getattr(curses, "COLORS", 8) if self.has_color else 0
+        self.pairs = getattr(curses, "COLOR_PAIRS", 1) if self.has_color else 1
+        try:
+            self.can_change = bool(curses.can_change_color()) and self.colors >= 32
+        except curses.error:
+            self.can_change = False
+        self._next_color = 16
+        self._next_pair = CHROME_PAIRS + 1
+        self._colors: Dict[str, int] = {}
+        self._pairs: Dict[Tuple[int, int], int] = {}
+        self.exhausted = False
+
+    # -- colours ----------------------------------------------------------- #
+
+    def color(self, spec: Optional[str]) -> int:
+        """curses colour number for a tmux colour spec; -1 means terminal default."""
+        if not self.has_color or spec is None or spec == "default":
+            return -1
+        cached = self._colors.get(spec)
+        if cached is not None:
+            return cached
+        rgb = renderer.color_to_rgb(spec)
+        if rgb is None:
+            index = -1
+        elif self.can_change and self._next_color < self.colors:
+            index = self._next_color
+            self._next_color += 1
+            try:
+                curses.init_color(
+                    index,
+                    rgb[0] * 1000 // 255, rgb[1] * 1000 // 255, rgb[2] * 1000 // 255,
+                )
+            except curses.error:
+                self.can_change = False
+                self._next_color -= 1
+                index = self._fallback_index(rgb)
+        else:
+            index = self._fallback_index(rgb)
+        self._colors[spec] = index
+        return index
+
+    def _fallback_index(self, rgb: Tuple[int, int, int]) -> int:
+        if self.colors >= 256:
+            return _xterm256_nearest(rgb)
+        if self.colors >= 16:
+            return _nearest(rgb, _ANSI16)
+        if self.colors >= 8:
+            return _nearest(rgb, _ANSI16[:8])
+        return -1
+
+    # -- pairs -------------------------------------------------------------- #
+
+    def pair(self, fg: Optional[str], bg: Optional[str]) -> int:
+        """Colour-pair attribute for the given tmux fg/bg specs."""
+        if not self.has_color:
+            return 0
+        key = (self.color(fg), self.color(bg))
+        cached = self._pairs.get(key)
+        if cached is not None:
+            return curses.color_pair(cached)
+        if self._next_pair >= self.pairs:
+            self.exhausted = True
+            return 0
+        number = self._next_pair
+        self._next_pair += 1
+        fg_idx, bg_idx = key
+        if bg_idx == -1 and not self.default_bg_ok:
+            bg_idx = 0
+        if fg_idx == -1 and not self.default_bg_ok:
+            fg_idx = 7
+        try:
+            curses.init_pair(number, fg_idx, bg_idx)
+        except curses.error:
+            self._pairs[key] = 0
+            return 0
+        self._pairs[key] = number
+        return curses.color_pair(number)
+
+    def attr(self, style: Style) -> int:
+        attr = self.pair(style.fg, style.bg)
+        if style.bold:
+            attr |= curses.A_BOLD
+        return attr
+
+
+# --------------------------------------------------------------------------- #
+# Menu model
+# --------------------------------------------------------------------------- #
+
+
+@dataclass
+class Item:
+    label: str
+    detail: str = ""
+    current: bool = False
+    swatch: Optional[str] = None
+    action: Optional[Callable[[], str]] = None
+    adjust: Optional[Callable[[int], str]] = None
+
+
+@dataclass
+class Category:
+    title: str
+    build: Callable[[], List[Item]]
+    hint: str = ""
+    scroll: int = 0
+    cursor: int = 0
+
+
+THRESHOLDS = (
+    ("disk_warn_gb", "Disk warning (GB free)", 5),
+    ("disk_crit_gb", "Disk critical (GB free)", 5),
+    ("cpu_warn_pct", "CPU warning (%)", 5),
+    ("cpu_crit_pct", "CPU critical (%)", 5),
+    ("battery_warn_pct", "Battery warning (%)", 5),
+    ("battery_crit_pct", "Battery critical (%)", 5),
+)
+
+SEGMENT_HELP = {
+    "thermal": "thermal pressure alert",
+    "sleep_risk": "idle-sleep watchdog",
+    "disk": "free disk space",
+    "battery": "charge level while discharging",
+    "cpu": "CPU utilisation",
+    "memory": "swap use and memory pressure",
+    "multi_client": "shown when more than one client is attached",
+    "clock": "the time",
+}
+
+WINDOW_HELP = (
+    ("hidden", "Zen: no window list at all"),
+    ("minimal", "Compact text window indicators"),
+    ("tabs", "Classic shaded tabs"),
+)
+
+
+# --------------------------------------------------------------------------- #
+# TUI
+# --------------------------------------------------------------------------- #
 
 
 class SentinelTUI:
-    def __init__(self, stdscr: curses.window):
+    def __init__(self, stdscr: "curses.window", opts: O.Options) -> None:
         self.stdscr = stdscr
-        self.cfg = load_config()
-        self.selected_category = 0
-        self.selected_subitem = 0
-        self.active_pane = 0  # 0: Category list, 1: Options list
-        self.sim_alerts = False
+        self.opts = opts
+        self.baseline = opts.as_dict()
+        self.sim = "healthy"
         self.message = ""
-        self.message_time = 0.0
+        self.message_kind = P_OK
+        self.pane = 0
+        self.cat_index = 0
+        self.confirm: Optional[str] = None
+        self.preview_error: Optional[str] = None
+        self._preview_cache: Dict[Tuple[str, str], List[Span]] = {}
 
-        # Setup curses
         curses.curs_set(0)
-        curses.use_default_colors()
-        self.stdscr.timeout(100)  # non-blocking with 100ms refresh
+        self.colors = ColorAllocator()
+        self._init_chrome()
+        stdscr.keypad(True)
+        stdscr.timeout(-1)  # blocking: no idle redraw loop
 
-        # Setup color pairs
-        self._init_colors()
+        self.categories = self._build_categories()
 
-    def _init_colors(self):
+    # -- setup ------------------------------------------------------------- #
+
+    def _init_chrome(self) -> None:
+        if not self.colors.has_color:
+            return
+        base = -1 if self.colors.default_bg_ok else curses.COLOR_BLACK
+        spec = (
+            (P_ACCENT, curses.COLOR_CYAN, base),
+            (P_OK, curses.COLOR_GREEN, base),
+            (P_WARN, curses.COLOR_YELLOW, base),
+            (P_ALERT, curses.COLOR_RED, base),
+            (P_SELECT, curses.COLOR_BLACK, curses.COLOR_CYAN),
+            (P_DIM, curses.COLOR_BLUE, base),
+            (P_TEXT, curses.COLOR_WHITE, base),
+        )
+        for number, fg, bg in spec:
+            try:
+                curses.init_pair(number, fg, bg)
+            except curses.error:
+                pass
+
+    def _build_categories(self) -> List[Category]:
+        return [
+            Category("Theme", self._items_theme),
+            Category("Segments", self._items_segments,
+                     "Enter/Space toggles a segment"),
+            Category("Steady state", self._items_alerts),
+            Category("Glyphs", self._items_glyphs),
+            Category("Position", self._items_position),
+            Category("Window list", self._items_windows),
+            Category("Thresholds", self._items_thresholds,
+                     "-/+ adjusts the selected threshold"),
+            Category("Simulation", self._items_sim),
+            Category("Save & apply", self._items_save),
+        ]
+
+    # -- item builders ------------------------------------------------------ #
+
+    def _items_theme(self) -> List[Item]:
+        current = self.opts.get("theme")
+        items = []
+        for stem in themes.list_themes():
+            palette = themes.load_palette(stem)
+            items.append(Item(
+                label=palette["name"],
+                detail=palette["description"],
+                current=(stem == current),
+                swatch=palette["accent"],
+                action=lambda s=stem: self._stage("theme", s),
+            ))
+        return items
+
+    def _items_segments(self) -> List[Item]:
+        enabled = set(self.opts.segment_list())
+        return [
+            Item(
+                label=name,
+                detail=("on  " if name in enabled else "off ") + SEGMENT_HELP[name],
+                current=(name in enabled),
+                action=lambda n=name: self._toggle(n),
+            )
+            for name in O.SEGMENTS
+        ]
+
+    def _items_alerts(self) -> List[Item]:
+        current = self.opts.get("alerts_only")
+        return [
+            Item("Alerts only", "quiet until something needs attention",
+                 current == "on", action=lambda: self._stage("alerts_only", "on")),
+            Item("Always on", "show every enabled metric continuously",
+                 current == "off", action=lambda: self._stage("alerts_only", "off")),
+        ]
+
+    def _items_glyphs(self) -> List[Item]:
+        current = self.opts.get("glyphs")
+        items = []
+        for mode in O.GLYPH_MODES:
+            glyphs = themes.load_glyphs(mode)
+            sample = " ".join(
+                glyphs[k] for k in
+                ("thermal", "sleep", "disk", "battery_full", "cpu", "memory",
+                 "clients")
+            )
+            items.append(Item(
+                label=glyphs["name"],
+                detail=sample,
+                current=(mode == current),
+                action=lambda m=mode: self._stage("glyphs", m),
+            ))
+        return items
+
+    def _items_position(self) -> List[Item]:
+        current = self.opts.get("position")
+        return [
+            Item("Top", "keeps the bottom of the pane free for prompts",
+                 current == "top", action=lambda: self._stage("position", "top")),
+            Item("Bottom", "traditional tmux placement",
+                 current == "bottom",
+                 action=lambda: self._stage("position", "bottom")),
+        ]
+
+    def _items_windows(self) -> List[Item]:
+        current = self.opts.get("windows")
+        return [
+            Item(mode, detail, current == mode,
+                 action=lambda m=mode: self._stage("windows", m))
+            for mode, detail in WINDOW_HELP
+        ]
+
+    def _items_thresholds(self) -> List[Item]:
+        items = []
+        for key, label, step in THRESHOLDS:
+            items.append(Item(
+                label=f"{label}: {self.opts.get(key)}",
+                detail=O.SPEC_BY_KEY[key].domain,
+                current=False,
+                adjust=lambda delta, k=key, s=step: self._adjust(k, delta * s),
+            ))
+        return items
+
+    def _items_sim(self) -> List[Item]:
+        return [
+            Item("Healthy", "nominal thermals, charged, quiet bar",
+                 self.sim == "healthy", action=lambda: self._set_sim("healthy")),
+            Item("Alert", "throttled, sleep risk, low disk, discharging, hot CPU",
+                 self.sim == "alert", action=lambda: self._set_sim("alert")),
+        ]
+
+    def _items_save(self) -> List[Item]:
+        dirty = self.opts.dirty_keys
+        detail = (", ".join(dirty) if dirty else "nothing changed")
+        return [
+            Item("Save & apply", detail, False, action=self._save),
+            Item("Discard changes", "revert to the saved settings", False,
+                 action=self._discard),
+        ]
+
+    # -- mutations ---------------------------------------------------------- #
+
+    def _stage(self, key: str, value: str) -> str:
         try:
-            curses.start_color()
-            curses.use_default_colors()
-            curses.init_pair(1, curses.COLOR_CYAN, -1)     # Accent / Header
-            curses.init_pair(2, curses.COLOR_GREEN, -1)    # Success / Active
-            curses.init_pair(3, curses.COLOR_YELLOW, -1)   # Warning
-            curses.init_pair(4, curses.COLOR_RED, -1)      # Alert
-            curses.init_pair(5, curses.COLOR_WHITE, curses.COLOR_BLUE)  # Highlighted
-            curses.init_pair(6, curses.COLOR_MAGENTA, -1)  # Special
-            curses.init_pair(7, curses.COLOR_BLACK, curses.COLOR_CYAN)  # Selected Tag
-            curses.init_pair(8, curses.COLOR_WHITE, -1)    # Bright White
-        except Exception:
-            pass
+            self.opts.stage(key, value)
+        except O.OptionError as exc:
+            return str(exc)
+        self._preview_cache.clear()
+        return f"{key} = {value}"
 
-    def run(self):
+    def _toggle(self, name: str) -> str:
+        enabled = self.opts.toggle_segment(name)
+        self._preview_cache.clear()
+        return f"segment {name} {'enabled' if enabled else 'disabled'}"
+
+    def _adjust(self, key: str, delta: int) -> str:
+        value = self.opts.int_of(key) + delta
+        spec = O.SPEC_BY_KEY[key]
+        candidate = str(max(0, value))
+        if not spec.check(candidate, self.opts):
+            return f"{key} would leave its range ({spec.domain})"
+        return self._stage(key, candidate)
+
+    def _set_sim(self, sim: str) -> str:
+        self.sim = sim
+        return f"simulating the {sim} state"
+
+    def _save(self) -> str:
+        result = self.opts.commit()
+        self.baseline = self.opts.as_dict()
+        self._preview_cache.clear()
+        if result.errors:
+            self.message_kind = P_ALERT
+            return "; ".join(result.errors)
+        return "saved to options.conf, regenerated and reloaded tmux"
+
+    def _discard(self) -> str:
+        self.opts = O.load(quiet=True)
+        self.baseline = self.opts.as_dict()
+        self._preview_cache.clear()
+        return "discarded unsaved changes"
+
+    # -- state -------------------------------------------------------------- #
+
+    @property
+    def dirty(self) -> bool:
+        return self.opts.as_dict() != self.baseline
+
+    # -- main loop ---------------------------------------------------------- #
+
+    def run(self) -> int:
         while True:
             self._draw()
             try:
                 ch = self.stdscr.getch()
-            except Exception:
-                ch = -1
-
-            if ch == -1:
+            except KeyboardInterrupt:
+                return 130
+            except curses.error:
                 continue
 
-            if ch in (ord('q'), ord('Q'), 27):  # ESC or q
-                break
-            elif ch in (curses.KEY_RESIZE,):
+            if ch == curses.KEY_RESIZE:
+                self._preview_cache.clear()
                 self.stdscr.clear()
-            elif ch in (ord('s'), ord('S')):
-                self._save_and_reload()
-            elif ch in (ord('t'), ord('T')):
-                self._cycle_theme()
-            elif ch in (ord('a'), ord('A')):
-                self.sim_alerts = not self.sim_alerts
-                self._set_msg(f"Alert simulation: {'ON (Warning State)' if self.sim_alerts else 'OFF (Healthy State)'}")
-            elif ch in (curses.KEY_UP, ord('k')):
-                self._handle_up()
-            elif ch in (curses.KEY_DOWN, ord('j')):
-                self._handle_down()
-            elif ch in (curses.KEY_LEFT, ord('h')):
-                self.active_pane = 0
-            elif ch in (curses.KEY_RIGHT, ord('l'), ord('\t')):
-                self.active_pane = 1
-            elif ch in (ord('\n'), ord('\r'), ord(' ')):
-                self._handle_select()
+                continue
 
-    def _set_msg(self, msg: str):
-        self.message = msg
-        self.message_time = time.time()
+            if self.confirm is not None:
+                if ch in (ord("y"), ord("Y")):
+                    return 0
+                if ch in (ord("s"), ord("S")):
+                    self._message(self._save())
+                    self.confirm = None
+                    return 0
+                self.confirm = None
+                continue
 
-    def _cycle_theme(self):
-        theme_keys = list(THEMES.keys())
-        curr = self.cfg.get("theme", "catppuccin-mocha")
-        idx = theme_keys.index(curr) if curr in theme_keys else 0
-        nxt = theme_keys[(idx + 1) % len(theme_keys)]
-        self.cfg["theme"] = nxt
-        self._set_msg(f"Theme switched to: {THEMES[nxt]['name']}")
+            if ch in (ord("q"), ord("Q"), 27):
+                if self.dirty:
+                    self.confirm = "quit"
+                    continue
+                return 0
+            if ch == 3:  # Ctrl-C delivered as a key
+                return 130
+            if ch in (ord("s"), ord("S")):
+                self._message(self._save())
+            elif ch in (ord("a"), ord("A")):
+                self._message(self._set_sim(
+                    "alert" if self.sim == "healthy" else "healthy"))
+            elif ch in (ord("t"), ord("T")):
+                self._message(self._cycle_theme())
+            elif ch in (curses.KEY_UP, ord("k")):
+                self._move(-1)
+            elif ch in (curses.KEY_DOWN, ord("j")):
+                self._move(1)
+            elif ch in (curses.KEY_LEFT, ord("h")):
+                self.pane = 0
+            elif ch in (curses.KEY_RIGHT, ord("l"), ord("\t")):
+                self.pane = 1
+            elif ch in (ord("-"), ord("_")):
+                self._adjust_selected(-1)
+            elif ch in (ord("+"), ord("=")):
+                self._adjust_selected(1)
+            elif ch in (curses.KEY_ENTER, ord("\n"), ord("\r"), ord(" ")):
+                self._activate()
 
-    def _save_and_reload(self):
-        save_config(self.cfg)
-        generate_all(self.cfg)
-        # Reload tmux if running
-        try:
-            conf_file = os.path.expanduser("~/.config/tmux-sentinel/sentinel.conf")
-            subprocess.run(["tmux", "source-file", conf_file], capture_output=True)
-            subprocess.run(["tmux", "refresh-client", "-S"], capture_output=True)
-            self._set_msg("✓ Configuration saved & tmux reloaded live!")
-        except Exception:
-            self._set_msg("✓ Configuration saved.")
+    def _cycle_theme(self) -> str:
+        available = themes.list_themes()
+        if not available:
+            return "no palettes found in themes/"
+        current = self.opts.get("theme")
+        index = available.index(current) if current in available else -1
+        return self._stage("theme", available[(index + 1) % len(available)])
 
-    def _categories(self) -> List[str]:
-        return [
-            "🎨 Color Theme",
-            "🧩 Health Segments",
-            "⚡ Alerts-Only Mode",
-            "🔤 Glyph Style",
-            "📐 Bar Position & Layout",
-            "🗂️ Window Tabs Style",
-            "🧪 Test Alert Simulation",
-            "💾 Save & Apply to Tmux",
-        ]
+    def _message(self, text: str, kind: int = P_OK) -> None:
+        self.message = text
+        self.message_kind = kind
 
-    def _handle_up(self):
-        if self.active_pane == 0:
-            self.selected_category = (self.selected_category - 1) % len(self._categories())
-            self.selected_subitem = 0
-        else:
-            sub_count = self._get_subitem_count()
-            if sub_count > 0:
-                self.selected_subitem = (self.selected_subitem - 1) % sub_count
+    def _category(self) -> Category:
+        return self.categories[self.cat_index]
 
-    def _handle_down(self):
-        if self.active_pane == 0:
-            self.selected_category = (self.selected_category + 1) % len(self._categories())
-            self.selected_subitem = 0
-        else:
-            sub_count = self._get_subitem_count()
-            if sub_count > 0:
-                self.selected_subitem = (self.selected_subitem + 1) % sub_count
-
-    def _get_subitem_count(self) -> int:
-        cat = self.selected_category
-        if cat == 0:  # Theme
-            return len(THEMES)
-        elif cat == 1:  # Segments
-            return len(self.cfg.get("segments", {}))
-        elif cat == 2:  # Alerts-only
-            return 2
-        elif cat == 3:  # Glyphs
-            return len(GLYPH_SETS)
-        elif cat == 4:  # Position
-            return 3
-        elif cat == 5:  # Window Tabs
-            return 3
-        elif cat == 6:  # Sim
-            return 2
-        elif cat == 7:  # Save
-            return 1
-        return 0
-
-    def _handle_select(self):
-        cat = self.selected_category
-        if self.active_pane == 0 and cat != 7:
-            self.active_pane = 1
+    def _move(self, delta: int) -> None:
+        if self.pane == 0:
+            self.cat_index = (self.cat_index + delta) % len(self.categories)
             return
+        cat = self._category()
+        count = len(cat.build())
+        if count:
+            cat.cursor = (cat.cursor + delta) % count
 
-        if cat == 0:  # Theme selection
-            theme_keys = list(THEMES.keys())
-            if 0 <= self.selected_subitem < len(theme_keys):
-                k = theme_keys[self.selected_subitem]
-                self.cfg["theme"] = k
-                self._set_msg(f"Theme set to: {THEMES[k]['name']}")
-        elif cat == 1:  # Segments toggle
-            seg_keys = list(self.cfg.get("segments", {}).keys())
-            if 0 <= self.selected_subitem < len(seg_keys):
-                k = seg_keys[self.selected_subitem]
-                curr = self.cfg["segments"].get(k, True)
-                self.cfg["segments"][k] = not curr
-                self._set_msg(f"Segment '{k}': {'ENABLED' if not curr else 'DISABLED'}")
-        elif cat == 2:  # Alerts-only toggle
-            self.cfg["alerts_only"] = (self.selected_subitem == 0)
-            self._set_msg(f"Mode: {'Alerts-Only (Quiet steady state)' if self.cfg['alerts_only'] else 'Always-On (All metrics visible)'}")
-        elif cat == 3:  # Glyphs
-            glyph_keys = list(GLYPH_SETS.keys())
-            if 0 <= self.selected_subitem < len(glyph_keys):
-                k = glyph_keys[self.selected_subitem]
-                self.cfg["glyph_mode"] = k
-                self._set_msg(f"Glyphs: {GLYPH_SETS[k]['name']}")
-        elif cat == 4:  # Position
-            pos_options = ["top", "bottom"]
-            if self.selected_subitem < 2:
-                self.cfg["position"] = pos_options[self.selected_subitem]
-                self._set_msg(f"Position: {self.cfg['position']}")
-            elif self.selected_subitem == 2:
-                accents = ["▌", "█", "◆", "|", "■"]
-                curr = self.cfg.get("left", {}).get("accent_symbol", "▌")
-                nxt = accents[(accents.index(curr) + 1) % len(accents)] if curr in accents else "▌"
-                self.cfg["left"]["accent_symbol"] = nxt
-                self._set_msg(f"Left Accent: {nxt}")
-        elif cat == 5:  # Window tabs
-            modes = ["hidden", "minimal", "tabs"]
-            if self.selected_subitem < len(modes):
-                self.cfg["windows"]["mode"] = modes[self.selected_subitem]
-                self._set_msg(f"Window Tabs: {modes[self.selected_subitem]}")
-        elif cat == 6:  # Sim
-            self.sim_alerts = (self.selected_subitem == 1)
-            self._set_msg(f"Simulation: {'Warning/Critical Alerts' if self.sim_alerts else 'Normal Healthy State'}")
-        elif cat == 7:  # Save
-            self._save_and_reload()
+    def _activate(self) -> None:
+        cat = self._category()
+        items = cat.build()
+        if self.pane == 0 and items:
+            self.pane = 1
+            return
+        if not items:
+            return
+        item = items[min(cat.cursor, len(items) - 1)]
+        if item.action is not None:
+            self._message(item.action())
+        elif item.adjust is not None:
+            self._message(item.adjust(1))
 
-    def _draw(self):
+    def _adjust_selected(self, direction: int) -> None:
+        cat = self._category()
+        items = cat.build()
+        if not items:
+            return
+        item = items[min(cat.cursor, len(items) - 1)]
+        if item.adjust is not None:
+            self._message(item.adjust(direction))
+
+    # -- drawing ------------------------------------------------------------ #
+
+    def _addstr(self, y: int, x: int, text: str, attr: int = 0) -> int:
+        """Write clipped text; returns the number of columns consumed."""
+        h, w = self.stdscr.getmaxyx()
+        if y < 0 or y >= h or x >= w:
+            return 0
+        clipped = truncate_to_width(text, w - x)
+        if not clipped:
+            return 0
+        try:
+            self.stdscr.addstr(y, x, clipped, attr)
+        except curses.error:
+            # Writing the final cell of the window is allowed to fail.
+            pass
+        return display_width(clipped)
+
+    def _draw(self) -> None:
         self.stdscr.erase()
         h, w = self.stdscr.getmaxyx()
-        if h < 20 or w < 60:
-            self.stdscr.addstr(0, 0, f"Terminal too small ({w}x{h}). Resize to at least 80x24.")
+        if w < MIN_WIDTH or h < MIN_HEIGHT:
+            self._addstr(0, 0, f"Terminal is {w}x{h}.", curses.A_BOLD)
+            self._addstr(
+                1, 0,
+                f"sentinel customize needs at least "
+                f"{MIN_WIDTH}x{MIN_HEIGHT}. Resize, or use `sentinel set`.",
+            )
             self.stdscr.refresh()
             return
 
-        # 1. Title Banner
-        title = " 󰌘 TMUX-SENTINEL CUSTOMIZER "
-        self.stdscr.addstr(0, 2, title, curses.A_BOLD | curses.color_pair(1))
-        info_str = "Press [s] to Save & Reload | [q] to Exit"
-        if w > len(title) + len(info_str) + 4:
-            self.stdscr.addstr(0, w - len(info_str) - 2, info_str, curses.color_pair(3))
+        title = " tmux-sentinel customizer "
+        self._addstr(0, 2, title, curses.A_BOLD | curses.color_pair(P_ACCENT))
+        marker = "  *  unsaved changes" if self.dirty else ""
+        if marker:
+            self._addstr(0, 2 + display_width(title), marker,
+                         curses.A_BOLD | curses.color_pair(P_WARN))
+        keys = "[s]ave  [q]uit"
+        self._addstr(0, max(0, w - display_width(keys) - 2), keys,
+                     curses.color_pair(P_DIM))
 
-        # 2. Live Preview Box
-        self._draw_preview_box(2, 2, w - 4)
+        self._draw_preview(2, 2, w - 4)
 
-        # 3. Message Bar (if recent)
-        msg_y = 7
-        if self.message and (time.time() - self.message_time < 4.0):
-            self.stdscr.addstr(msg_y, 4, f"● {self.message}", curses.A_BOLD | curses.color_pair(2))
+        msg_y = 6
+        if self.message:
+            self._addstr(msg_y, 4, self.message,
+                         curses.A_BOLD | curses.color_pair(self.message_kind))
         else:
-            self.stdscr.addstr(msg_y, 4, "─" * (w - 8), curses.color_pair(1))
+            self._addstr(msg_y, 4, "-" * (w - 8), curses.color_pair(P_DIM))
 
-        # 4. Two-Column Layout (Categories & Options)
-        body_y = 9
+        body_y = 8
         body_h = h - body_y - 3
-        col_w = 26
-
+        col_w = 22
         self._draw_categories(body_y, 2, col_w, body_h)
-        self._draw_options(body_y, col_w + 5, w - col_w - 7, body_h)
+        self._draw_items(body_y, col_w + 4, w - col_w - 6, body_h)
 
-        # 5. Bottom Help Bar
-        help_text = "[↑/↓/j/k] Navigate  [Enter/Space] Select  [Tab/←/→] Switch Pane  [t] Theme  [a] Sim Alert  [s] Save"
-        self.stdscr.addstr(h - 2, 2, help_text[:w-4], curses.color_pair(1))
-
+        if self.confirm is not None:
+            prompt = (f"Discard {len(self.opts.dirty_keys)} unsaved change(s)? "
+                      "[y] discard  [s] save and quit  [any other key] cancel")
+            self._addstr(h - 2, 2, prompt,
+                         curses.A_BOLD | curses.color_pair(P_ALERT))
+        else:
+            help_text = (
+                "[jk/arrows] move  [tab] pane  [enter] select  "
+                "[-/+] threshold  [t] theme  [a] sim  [s] save  [q] quit"
+            )
+            self._addstr(h - 2, 2, help_text, curses.color_pair(P_DIM))
         self.stdscr.refresh()
 
-    def _draw_preview_box(self, y: int, x: int, width: int):
-        # Draw border box
-        self.stdscr.addstr(y, x, "╭─ Live Status Bar Preview " + "─" * (width - 27) + "╮", curses.color_pair(1))
-        self.stdscr.addstr(y + 1, x, "│", curses.color_pair(1))
-        self.stdscr.addstr(y + 1, x + width - 1, "│", curses.color_pair(1))
-        self.stdscr.addstr(y + 2, x, "│", curses.color_pair(1))
-        self.stdscr.addstr(y + 2, x + width - 1, "│", curses.color_pair(1))
-        self.stdscr.addstr(y + 3, x, "╰" + "─" * (width - 2) + "╯", curses.color_pair(1))
+    def _preview_spans(self, bar_width: int) -> List[Span]:
+        key = (self.sim, str(bar_width))
+        cached = self._preview_cache.get(key)
+        if cached is not None:
+            return cached
+        try:
+            bar = renderer.compose_bar(self.opts, bar_width, sim=self.sim)
+            spans = renderer.parse_tmux(bar)
+            self.preview_error = None
+        except O.EngineMissing as exc:
+            self.preview_error = str(exc).split("\n")[0]
+            spans = []
+        except (RuntimeError, themes.DataFileError, OSError) as exc:
+            self.preview_error = str(exc)
+            spans = []
+        self._preview_cache[key] = spans
+        return spans
 
-        # Simulated state
-        if self.sim_alerts:
-            sim_state = {
-                "thermal": 82,
-                "sleep_risk": True,
-                "disk_gb": 12,
-                "batt_pct": 18,
-                "batt_discharging": True,
-                "cpu_pct": 94,
-                "swap_gb": "24.1G",
-                "pressure_level": 4,
-                "multi_client": 2,
-                "time_str": "15:42",
-                "prefix_active": False,
-                "in_copy_mode": False,
-            }
+    def _draw_preview(self, y: int, x: int, width: int) -> None:
+        accent = curses.color_pair(P_ACCENT)
+        heading = "- Live status bar preview "
+        top = "+" + heading + "-" * max(0, width - 2 - len(heading)) + "+"
+        self._addstr(y, x, top[:width], accent)
+        for row in (y + 1, y + 2):
+            self._addstr(row, x, "|", accent)
+            self._addstr(row, x + width - 1, "|", accent)
+        self._addstr(y + 3, x, "+" + "-" * (width - 2) + "+", accent)
+
+        bar_width = width - 4
+        if bar_width < 8:
+            return
+        spans = self._preview_spans(bar_width)
+        if self.preview_error is not None:
+            self._addstr(y + 1, x + 2,
+                         pad_to_width(self.preview_error, bar_width),
+                         curses.color_pair(P_ALERT))
         else:
-            sim_state = {
-                "thermal": 100,
-                "sleep_risk": False,
-                "disk_gb": 54,
-                "batt_pct": 95,
-                "batt_discharging": False,
-                "cpu_pct": 22,
-                "swap_gb": "23.3G",
-                "pressure_level": 1,
-                "multi_client": 1,
-                "time_str": "15:42",
-                "prefix_active": False,
-                "in_copy_mode": False,
-            }
+            palette = themes.load_palette(self.opts.get("theme"))
+            bg = palette["bg"]
+            col = x + 2
+            used = 0
+            for span in spans:
+                if used >= bar_width:
+                    break
+                text = truncate_to_width(span.text, bar_width - used)
+                if not text:
+                    continue
+                style = Style(span.style.fg, span.style.bg or bg, span.style.bold)
+                used += self._addstr(y + 1, col + used, text,
+                                     self.colors.attr(style))
+            if used < bar_width:
+                self._addstr(y + 1, col + used, " " * (bar_width - used),
+                             self.colors.attr(Style(None, bg, False)))
 
-        # Build preview string
-        theme_name = self.cfg.get("theme", "catppuccin-mocha")
-        theme = THEMES.get(theme_name, THEMES["catppuccin-mocha"])
-        glyphs = GLYPH_SETS.get(self.cfg.get("glyph_mode", "nerd"), GLYPH_SETS["nerd"])
-        accent_sym = self.cfg.get("left", {}).get("accent_symbol", glyphs["accent"])
-        win_mode = self.cfg.get("windows", {}).get("mode", "hidden")
+        palette = themes.load_palette(self.opts.get("theme"))
+        glyphs = themes.load_glyphs(self.opts.get("glyphs"))
+        label = (f"{palette['name']} | {glyphs['name']} | "
+                 f"simulating: {self.sim} | position: {self.opts.get('position')}")
+        if not self.colors.can_change and self.colors.colors < 256:
+            label += f" | {self.colors.colors}-colour terminal, colours approximated"
+        self._addstr(y + 2, x + 2, truncate_to_width(label, bar_width),
+                     curses.color_pair(P_WARN if self.sim == "alert" else P_OK))
 
-        left_str = f" {accent_sym}  main "
-        if win_mode == "minimal":
-            left_str += "| 1:dev | 2:sh "
-        elif win_mode == "tabs":
-            left_str += "[1 dev] [2 sh] "
-
-        # Right segments
-        sep = glyphs["sep"]
-        r_parts = []
-        segs = self.cfg.get("segments", {})
-        alerts_only = self.cfg.get("alerts_only", True)
-
-        if segs.get("thermal", True):
-            if sim_state["thermal"] < 100:
-                r_parts.append(f"{glyphs['thermal']} {sim_state['thermal']}% (WARN)")
-            elif not alerts_only:
-                r_parts.append(f"{glyphs['thermal']} 100%")
-
-        if segs.get("sleep_risk", True) and sim_state["sleep_risk"]:
-            r_parts.append(f"{glyphs['sleep']} 10m (RISK)")
-
-        if segs.get("disk", True):
-            r_parts.append(f"{glyphs['disk']} {sim_state['disk_gb']}G")
-
-        if segs.get("battery", True):
-            if sim_state["batt_discharging"]:
-                r_parts.append(f"{glyphs['battery_low']} {sim_state['batt_pct']}%")
-            elif not alerts_only:
-                r_parts.append(f"{glyphs['battery_full']} {sim_state['batt_pct']}%")
-
-        if segs.get("cpu", True):
-            r_parts.append(f"{glyphs['cpu']} {sim_state['cpu_pct']}%")
-
-        if segs.get("memory", True):
-            r_parts.append(f"{glyphs['memory']} {sim_state['swap_gb']}")
-
-        if segs.get("multi_client", True) and sim_state["multi_client"] > 1:
-            r_parts.append(f"{glyphs['clients']} {sim_state['multi_client']}")
-
-        if segs.get("clock", True):
-            r_parts.append(f"{sim_state['time_str']} ")
-
-        right_str = sep.join(r_parts)
-        inner_w = width - 4
-        pad = inner_w - len(left_str) - len(right_str)
-        if pad < 1:
-            pad = 1
-
-        bar_line = (left_str + " " * pad + right_str)[:inner_w]
-
-        # Draw simulated preview bar
-        self.stdscr.addstr(y + 1, x + 2, bar_line, curses.A_REVERSE | curses.color_pair(1))
-        sim_label = f"[{'⚠ Simulating Alert State' if self.sim_alerts else '✔ Simulating Healthy State'}] Theme: {theme['name']} (pos: {self.cfg.get('position', 'top')})"
-        self.stdscr.addstr(y + 2, x + 2, sim_label[:inner_w], curses.color_pair(3 if self.sim_alerts else 2))
-
-    def _draw_categories(self, y: int, x: int, width: int, height: int):
-        cats = self._categories()
-        for idx, cat in enumerate(cats):
+    def _draw_categories(self, y: int, x: int, width: int, height: int) -> None:
+        for idx, cat in enumerate(self.categories):
             if idx >= height:
                 break
-            is_sel = (idx == self.selected_category)
-            is_active = (is_sel and self.active_pane == 0)
-
-            prefix = "▶ " if is_sel else "  "
-            line = f"{prefix}{cat}"[:width].ljust(width)
-
-            if is_active:
-                self.stdscr.addstr(y + idx, x, line, curses.A_BOLD | curses.color_pair(5))
-            elif is_sel:
-                self.stdscr.addstr(y + idx, x, line, curses.A_BOLD | curses.color_pair(1))
+            selected = idx == self.cat_index
+            prefix = "> " if selected else "  "
+            line = pad_to_width(prefix + cat.title, width)
+            if selected and self.pane == 0:
+                attr = curses.A_BOLD | curses.color_pair(P_SELECT)
+            elif selected:
+                attr = curses.A_BOLD | curses.color_pair(P_ACCENT)
             else:
-                self.stdscr.addstr(y + idx, x, line, curses.color_pair(8))
+                attr = curses.color_pair(P_TEXT)
+            self._addstr(y + idx, x, line, attr)
 
-    def _draw_options(self, y: int, x: int, width: int, height: int):
-        cat = self.selected_category
+    def _draw_items(self, y: int, x: int, width: int, height: int) -> None:
+        cat = self._category()
+        items = cat.build()
+        if not items:
+            return
+        cat.cursor = min(cat.cursor, len(items) - 1)
+        rows = max(1, height - (1 if cat.hint else 0))
+        if cat.cursor < cat.scroll:
+            cat.scroll = cat.cursor
+        elif cat.cursor >= cat.scroll + rows:
+            cat.scroll = cat.cursor - rows + 1
+        cat.scroll = max(0, min(cat.scroll, max(0, len(items) - rows)))
 
-        if cat == 0:  # Theme
-            theme_keys = list(THEMES.keys())
-            curr_theme = self.cfg.get("theme", "catppuccin-mocha")
-            for idx, k in enumerate(theme_keys):
-                if idx >= height:
-                    break
-                t = THEMES[k]
-                is_curr = (k == curr_theme)
-                is_sel = (idx == self.selected_subitem and self.active_pane == 1)
+        for row in range(rows):
+            idx = cat.scroll + row
+            if idx >= len(items):
+                break
+            item = items[idx]
+            selected = idx == cat.cursor and self.pane == 1
+            mark = "*" if item.current else " "
+            col = x
+            if selected:
+                attr = curses.A_BOLD | curses.color_pair(P_SELECT)
+            elif item.current:
+                attr = curses.A_BOLD | curses.color_pair(P_OK)
+            else:
+                attr = curses.color_pair(P_TEXT)
+            body = f"{mark} "
+            col += self._addstr(y + row, col, body, attr)
+            if item.swatch:
+                # Two blanks painted with the theme's accent as background:
+                # always exactly two columns wide, whatever the font does.
+                col += self._addstr(y + row, col, "  ",
+                                    self.colors.pair(None, item.swatch))
+                col += self._addstr(y + row, col, " ", attr)
+            remaining = width - (col - x)
+            text = item.label
+            if item.detail:
+                text = f"{item.label}  {item.detail}"
+            self._addstr(y + row, col, pad_to_width(text, max(0, remaining)), attr)
 
-                marker = "● " if is_curr else "○ "
-                text = f"{marker}{t['name']} - {t['description']}"[:width]
-                if is_sel:
-                    self.stdscr.addstr(y + idx, x, text.ljust(width), curses.A_BOLD | curses.color_pair(5))
-                elif is_curr:
-                    self.stdscr.addstr(y + idx, x, text, curses.A_BOLD | curses.color_pair(2))
-                else:
-                    self.stdscr.addstr(y + idx, x, text, curses.color_pair(8))
-
-        elif cat == 1:  # Segments
-            segs = self.cfg.get("segments", {})
-            seg_items = [
-                ("thermal", "Thermal Throttling", "Alerts in red when CPU speed limit < 100%"),
-                ("sleep_risk", "Sleep Risk Watchdog", "Alerts when idle sleep armed without wake assertion"),
-                ("disk", "Disk Free Space", "Quantified disk GB (yellow <25G, red <15G)"),
-                ("battery", "Battery Monitor", "Shows discharge level; alert colored on low charge"),
-                ("cpu", "CPU Usage %", "Calculates delta CPU ticks; alerts on high load"),
-                ("memory", "Memory Pressure & Swap", "Shows swap used, colored by kernel memory pressure"),
-                ("multi_client", "Multi-Client Indicator", "Shows icon & connected count when > 1 client attached"),
-                ("clock", "Clock", "Displays time/date in status bar"),
-            ]
-            for idx, (key, name, desc) in enumerate(seg_items):
-                if idx >= height:
-                    break
-                enabled = segs.get(key, True)
-                is_sel = (idx == self.selected_subitem and self.active_pane == 1)
-
-                status = "[ENABLED] " if enabled else "[DISABLED]"
-                text = f"{status} {name} ── {desc}"[:width]
-
-                if is_sel:
-                    self.stdscr.addstr(y + idx, x, text.ljust(width), curses.A_BOLD | curses.color_pair(5))
-                elif enabled:
-                    self.stdscr.addstr(y + idx, x, text, curses.A_BOLD | curses.color_pair(2))
-                else:
-                    self.stdscr.addstr(y + idx, x, text, curses.color_pair(4))
-
-        elif cat == 2:  # Alerts-only mode
-            options = [
-                ("Alerts-Only (Recommended)", "Whisper-quiet steady state; segments appear only when actionable/risky."),
-                ("Always-On Metrics", "Display all enabled health metrics continuously in status bar."),
-            ]
-            curr_alerts = self.cfg.get("alerts_only", True)
-            for idx, (name, desc) in enumerate(options):
-                is_curr = (idx == 0 and curr_alerts) or (idx == 1 and not curr_alerts)
-                is_sel = (idx == self.selected_subitem and self.active_pane == 1)
-
-                marker = "● " if is_curr else "○ "
-                text = f"{marker}{name}\n     {desc}"
-                line1 = f"{marker}{name}"
-                line2 = f"    {desc}"
-
-                row = y + (idx * 3)
-                if row + 1 < y + height:
-                    if is_sel:
-                        self.stdscr.addstr(row, x, line1.ljust(width), curses.A_BOLD | curses.color_pair(5))
-                    elif is_curr:
-                        self.stdscr.addstr(row, x, line1, curses.A_BOLD | curses.color_pair(2))
-                    else:
-                        self.stdscr.addstr(row, x, line1, curses.color_pair(8))
-                    self.stdscr.addstr(row + 1, x, line2[:width], curses.color_pair(1))
-
-        elif cat == 3:  # Glyphs
-            glyph_keys = list(GLYPH_SETS.keys())
-            curr_glyph = self.cfg.get("glyph_mode", "nerd")
-            for idx, k in enumerate(glyph_keys):
-                g = GLYPH_SETS[k]
-                is_curr = (k == curr_glyph)
-                is_sel = (idx == self.selected_subitem and self.active_pane == 1)
-
-                sample = f"{g['accent']} {g['thermal']} {g['sleep']} {g['disk']} {g['battery_full']} {g['cpu']} {g['memory']} {g['clients']}"
-                line = f"{'●' if is_curr else '○'} {g['name']} ── Example: {sample}"[:width]
-
-                if is_sel:
-                    self.stdscr.addstr(y + idx, x, line.ljust(width), curses.A_BOLD | curses.color_pair(5))
-                elif is_curr:
-                    self.stdscr.addstr(y + idx, x, line, curses.A_BOLD | curses.color_pair(2))
-                else:
-                    self.stdscr.addstr(y + idx, x, line, curses.color_pair(8))
-
-        elif cat == 4:  # Position & Layout
-            options = [
-                ("Top Position", "Puts status bar at top (preserves bottom of pane for agent CLI / prompt)"),
-                ("Bottom Position", "Standard traditional tmux bottom status bar"),
-                (f"Left Accent Symbol: {self.cfg.get('left', {}).get('accent_symbol', '▌')}", "Cycle accent glyph indicator (▌, █, ◆, |, ■)"),
-            ]
-            curr_pos = self.cfg.get("position", "top")
-            for idx, (name, desc) in enumerate(options):
-                is_curr = (idx == 0 and curr_pos == "top") or (idx == 1 and curr_pos == "bottom")
-                is_sel = (idx == self.selected_subitem and self.active_pane == 1)
-
-                marker = "● " if is_curr else "○ " if idx < 2 else "▶ "
-                line1 = f"{marker}{name}"
-                line2 = f"    {desc}"
-
-                row = y + (idx * 3)
-                if row + 1 < y + height:
-                    if is_sel:
-                        self.stdscr.addstr(row, x, line1.ljust(width), curses.A_BOLD | curses.color_pair(5))
-                    elif is_curr:
-                        self.stdscr.addstr(row, x, line1, curses.A_BOLD | curses.color_pair(2))
-                    else:
-                        self.stdscr.addstr(row, x, line1, curses.color_pair(8))
-                    self.stdscr.addstr(row + 1, x, line2[:width], curses.color_pair(1))
-
-        elif cat == 5:  # Window Tabs
-            options = [
-                ("Hidden / Zen Mode (Recommended)", "Zero tab clutter. Perfect for one-task/one-agent per session."),
-                ("Minimal Window Indicator", "Clean text pills showing current & other window numbers."),
-                ("Classic Tab Style", "Full shaded background tabs with borders."),
-            ]
-            curr_win = self.cfg.get("windows", {}).get("mode", "hidden")
-            for idx, (name, desc) in enumerate(options):
-                is_curr = (
-                    (idx == 0 and curr_win == "hidden") or
-                    (idx == 1 and curr_win == "minimal") or
-                    (idx == 2 and curr_win == "tabs")
-                )
-                is_sel = (idx == self.selected_subitem and self.active_pane == 1)
-
-                marker = "● " if is_curr else "○ "
-                line1 = f"{marker}{name}"
-                line2 = f"    {desc}"
-
-                row = y + (idx * 3)
-                if row + 1 < y + height:
-                    if is_sel:
-                        self.stdscr.addstr(row, x, line1.ljust(width), curses.A_BOLD | curses.color_pair(5))
-                    elif is_curr:
-                        self.stdscr.addstr(row, x, line1, curses.A_BOLD | curses.color_pair(2))
-                    else:
-                        self.stdscr.addstr(row, x, line1, curses.color_pair(8))
-                    self.stdscr.addstr(row + 1, x, line2[:width], curses.color_pair(1))
-
-        elif cat == 6:  # Sim alert
-            options = [
-                ("Normal Steady State", "Simulate standard healthy state (quiet status bar, only load/swap)"),
-                ("Trigger Alert State", "Simulate thermal throttling (82%), low disk (12G), discharging battery (18%), CPU spike (94%)"),
-            ]
-            for idx, (name, desc) in enumerate(options):
-                is_curr = (idx == 1 and self.sim_alerts) or (idx == 0 and not self.sim_alerts)
-                is_sel = (idx == self.selected_subitem and self.active_pane == 1)
-
-                marker = "● " if is_curr else "○ "
-                line1 = f"{marker}{name}"
-                line2 = f"    {desc}"
-
-                row = y + (idx * 3)
-                if row + 1 < y + height:
-                    if is_sel:
-                        self.stdscr.addstr(row, x, line1.ljust(width), curses.A_BOLD | curses.color_pair(5))
-                    elif is_curr:
-                        self.stdscr.addstr(row, x, line1, curses.A_BOLD | curses.color_pair(3 if self.sim_alerts else 2))
-                    else:
-                        self.stdscr.addstr(row, x, line1, curses.color_pair(8))
-                    self.stdscr.addstr(row + 1, x, line2[:width], curses.color_pair(1))
-
-        elif cat == 7:  # Save
-            self.stdscr.addstr(y, x, "▶ Press [Enter] or [s] to save configuration and reload tmux live!", curses.A_BOLD | curses.color_pair(2))
-            self.stdscr.addstr(y + 2, x, "Configuration will be written to:", curses.color_pair(1))
-            self.stdscr.addstr(y + 3, x + 2, "• ~/.config/tmux-sentinel/config.json", curses.color_pair(8))
-            self.stdscr.addstr(y + 4, x + 2, "• ~/.config/tmux-sentinel/sentinel.conf", curses.color_pair(8))
-            self.stdscr.addstr(y + 5, x + 2, "• ~/.config/tmux-sentinel/env.sh", curses.color_pair(8))
+        if cat.hint:
+            self._addstr(y + rows, x, truncate_to_width(cat.hint, width),
+                         curses.color_pair(P_DIM))
+        if len(items) > rows:
+            self._addstr(y + rows, x + width - 12,
+                         f"{cat.cursor + 1}/{len(items)}",
+                         curses.color_pair(P_DIM))
 
 
-def start_tui():
-    """Entrypoint to launch the curses TUI."""
-    curses.wrapper(lambda stdscr: SentinelTUI(stdscr).run())
+def start_tui() -> int:
+    """Launch the customizer.  Returns a process exit code."""
+    if not sys.stdout.isatty():
+        print("sentinel: customize needs a terminal; try `sentinel preview`",
+              file=sys.stderr)
+        return 1
+    try:
+        opts = O.load()
+    except O.ConfigError as exc:
+        print(f"sentinel: error: {exc}", file=sys.stderr)
+        return 1
+    if "ESCDELAY" not in os.environ:
+        os.environ["ESCDELAY"] = "25"
+    try:
+        return curses.wrapper(lambda scr: SentinelTUI(scr, opts).run())
+    except KeyboardInterrupt:
+        return 130

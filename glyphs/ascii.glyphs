@@ -1,0 +1,12 @@
+name=Plain ASCII
+accent=|
+sep= | 
+thermal=THR
+sleep=SLP
+disk=DSK
+battery_full=BAT
+battery_mid=BAT
+battery_low=BAT
+cpu=CPU
+memory=MEM
+clients=USR

@@ -1,9 +1,10 @@
 # Build artifacts
-bin/mac-cpu-pct
+bin/sentinel-status
 *.o
 *.so
 *.dylib
 *.a
+*.dSYM/
 
 # Python
 __pycache__/

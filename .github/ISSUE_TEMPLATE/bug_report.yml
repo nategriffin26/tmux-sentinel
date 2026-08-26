@@ -1,0 +1,79 @@
+name: Bug report
+description: Report a reproducible problem with tmux-sentinel
+title: "[bug] "
+labels: [bug]
+body:
+  - type: markdown
+    attributes:
+      value: |-
+        Please remove secrets and private paths. Run `sentinel doctor` and paste its complete output below.
+  - type: input
+    id: tmux-version
+    attributes:
+      label: tmux version
+      description: Output of `tmux -V`.
+      placeholder: tmux 3.4
+    validations:
+      required: true
+  - type: input
+    id: os
+    attributes:
+      label: Operating system and version
+      placeholder: macOS 15.3 / Ubuntu 24.04
+    validations:
+      required: true
+  - type: input
+    id: terminal
+    attributes:
+      label: Terminal emulator
+      placeholder: WezTerm 20240203
+    validations:
+      required: true
+  - type: input
+    id: term
+    attributes:
+      label: $TERM
+      placeholder: xterm-256color
+    validations:
+      required: true
+  - type: dropdown
+    id: nerd-font
+    attributes:
+      label: Is a Nerd Font installed and active?
+      options: ["Yes", "No", "Not sure"]
+    validations:
+      required: true
+  - type: textarea
+    id: options
+    attributes:
+      label: "@sentinel_* options in use"
+      description: Paste relevant `show-options -g | grep sentinel` output.
+      render: tmux
+    validations:
+      required: true
+  - type: textarea
+    id: doctor
+    attributes:
+      label: Full sentinel doctor output
+      description: Paste the complete output of `sentinel doctor`, including every diagnostic line.
+      render: text
+    validations:
+      required: true
+  - type: textarea
+    id: steps
+    attributes:
+      label: Steps to reproduce
+    validations:
+      required: true
+  - type: textarea
+    id: expected
+    attributes:
+      label: Expected behavior
+    validations:
+      required: true
+  - type: textarea
+    id: actual
+    attributes:
+      label: Actual behavior
+    validations:
+      required: true

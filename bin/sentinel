@@ -1,14 +1,32 @@
 #!/usr/bin/env python3
-"""Executable launcher for tmux-sentinel CLI & TUI."""
+"""Launcher for the tmux-sentinel CLI and TUI.
 
+Must stay a symlink to (or live inside) the repository, because it imports the
+``cli`` package sitting next to it.  ``make install-bin`` links rather than
+copies for exactly this reason.
+"""
+
+import os
 import sys
 from pathlib import Path
 
-# Add repo root to sys.path
 REPO_ROOT = Path(__file__).resolve().parent.parent
+MAIN = REPO_ROOT / "cli" / "main.py"
+
+if not MAIN.is_file():
+    sys.stderr.write(
+        f"sentinel: cannot find {MAIN}\n"
+        f"  This launcher resolved its repository to {REPO_ROOT}, which has no "
+        "cli/ package.\n"
+        "  It was probably copied instead of linked. Symlink it instead:\n"
+        "    ln -sf /path/to/tmux-sentinel/bin/sentinel "
+        f"{os.path.join(os.path.expanduser('~'), '.local/bin/sentinel')}\n"
+    )
+    raise SystemExit(1)
+
 sys.path.insert(0, str(REPO_ROOT))
 
-from cli.main import main
+from cli.main import main  # noqa: E402  (path must be set up first)
 
 if __name__ == "__main__":
-    main()
+    sys.exit(main())

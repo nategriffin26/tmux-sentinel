@@ -1,291 +1,137 @@
-"""Theme palettes and color mappings for tmux-sentinel."""
+"""Loader for the theme and glyph data files.
 
-from typing import Dict, Any
+``themes/<stem>.palette`` and ``glyphs/<mode>.glyphs`` are the sole definition of
+a palette / glyph set (CONTRACT SS7).  Python holds no second copy: there are no
+``THEMES`` or ``GLYPH_SETS`` dict literals any more.
+"""
 
-THEMES: Dict[str, Dict[str, Any]] = {
-    "catppuccin-mocha": {
-        "name": "Catppuccin Mocha",
-        "description": "Smooth dark palette with soothing pastel accents",
-        "bg": "default",
-        "fg": "#cdd6f4",
-        "dim": "#6c7086",
-        "val": "#a6adc8",
-        "sep": "#45475a",
-        "accent": "#89b4fa",       # Blue
-        "prefix": "#f38ba8",       # Red
-        "copy_mode": "#f9e2af",    # Yellow
-        "warn": "#f9e2af",         # Yellow
-        "alert": "#f38ba8",        # Red
-        "peach": "#fab387",        # Peach / Orange
-        "info": "#94e2d5",         # Teal
-        "border": "#313244",
-        "active_border": "#89b4fa",
-        "message_bg": "#313244",
-        "mode_bg": "#45475a",
-    },
-    "catppuccin-macchiato": {
-        "name": "Catppuccin Macchiato",
-        "description": "Medium-contrast dark Catppuccin variant",
-        "bg": "default",
-        "fg": "#cad3f5",
-        "dim": "#6e738d",
-        "val": "#a5adcb",
-        "sep": "#494d64",
-        "accent": "#8aadf4",
-        "prefix": "#ed8796",
-        "copy_mode": "#eed49f",
-        "warn": "#eed49f",
-        "alert": "#ed8796",
-        "peach": "#f5a97f",
-        "info": "#8bd5ca",
-        "border": "#363a4f",
-        "active_border": "#8aadf4",
-        "message_bg": "#363a4f",
-        "mode_bg": "#494d64",
-    },
-    "catppuccin-frappe": {
-        "name": "Catppuccin Frappé",
-        "description": "Soft muted dark Catppuccin variant",
-        "bg": "default",
-        "fg": "#c6d0f5",
-        "dim": "#737994",
-        "val": "#a5b4fc",
-        "sep": "#51576d",
-        "accent": "#8caaee",
-        "prefix": "#e78284",
-        "copy_mode": "#e5c890",
-        "warn": "#e5c890",
-        "alert": "#e78284",
-        "peach": "#ef9f76",
-        "info": "#81c8be",
-        "border": "#414559",
-        "active_border": "#8caaee",
-        "message_bg": "#414559",
-        "mode_bg": "#51576d",
-    },
-    "catppuccin-latte": {
-        "name": "Catppuccin Latte",
-        "description": "Clean, high-legibility light theme",
-        "bg": "#eff1f5",
-        "fg": "#4c4f69",
-        "dim": "#9ca0b0",
-        "val": "#5c5f77",
-        "sep": "#bcc0cc",
-        "accent": "#1e66f5",
-        "prefix": "#d20f39",
-        "copy_mode": "#df8e1d",
-        "warn": "#df8e1d",
-        "alert": "#d20f39",
-        "peach": "#fe640b",
-        "info": "#179299",
-        "border": "#ccd0da",
-        "active_border": "#1e66f5",
-        "message_bg": "#e6e9ef",
-        "mode_bg": "#ccd0da",
-    },
-    "tokyo-night": {
-        "name": "Tokyo Night",
-        "description": "Vibrant night theme inspired by Tokyo neon lights",
-        "bg": "default",
-        "fg": "#c0caf5",
-        "dim": "#565f89",
-        "val": "#9aa5ce",
-        "sep": "#3b4261",
-        "accent": "#7aa2f7",
-        "prefix": "#f7768e",
-        "copy_mode": "#e0af68",
-        "warn": "#e0af68",
-        "alert": "#f7768e",
-        "peach": "#ff9e64",
-        "info": "#7dcfff",
-        "border": "#292e42",
-        "active_border": "#7aa2f7",
-        "message_bg": "#24283b",
-        "mode_bg": "#3b4261",
-    },
-    "nord": {
-        "name": "Nord",
-        "description": "Arctic, north-bluish clean aesthetic",
-        "bg": "default",
-        "fg": "#d8dee9",
-        "dim": "#616e88",
-        "val": "#eceff4",
-        "sep": "#434c5e",
-        "accent": "#88c0d0",
-        "prefix": "#bf616a",
-        "copy_mode": "#ebcb8b",
-        "warn": "#ebcb8b",
-        "alert": "#bf616a",
-        "peach": "#d08770",
-        "info": "#8fbcbb",
-        "border": "#3b4252",
-        "active_border": "#88c0d0",
-        "message_bg": "#2e3440",
-        "mode_bg": "#434c5e",
-    },
-    "gruvbox-dark": {
-        "name": "Gruvbox Dark",
-        "description": "Retro groove warmth with earthy organic tones",
-        "bg": "default",
-        "fg": "#ebdbb2",
-        "dim": "#928374",
-        "val": "#d5c4a1",
-        "sep": "#504945",
-        "accent": "#83a598",
-        "prefix": "#fb4934",
-        "copy_mode": "#fabd2f",
-        "warn": "#fabd2f",
-        "alert": "#fb4934",
-        "peach": "#fe8019",
-        "info": "#8ec07c",
-        "border": "#3c3836",
-        "active_border": "#83a598",
-        "message_bg": "#32302f",
-        "mode_bg": "#504945",
-    },
-    "rose-pine": {
-        "name": "Rosé Pine",
-        "description": "All natural pine, faux fur, and dusky floral rose",
-        "bg": "default",
-        "fg": "#e0def4",
-        "dim": "#6e6a86",
-        "val": "#908caa",
-        "sep": "#393552",
-        "accent": "#9ccfd8",
-        "prefix": "#eb6f92",
-        "copy_mode": "#f6c177",
-        "warn": "#f6c177",
-        "alert": "#eb6f92",
-        "peach": "#ea9a97",
-        "info": "#c4a7e7",
-        "border": "#26233a",
-        "active_border": "#9ccfd8",
-        "message_bg": "#21202e",
-        "mode_bg": "#393552",
-    },
-    "dracula": {
-        "name": "Dracula",
-        "description": "Famous dark gothic theme with vibrant saturated accents",
-        "bg": "default",
-        "fg": "#f8f8f2",
-        "dim": "#6272a4",
-        "val": "#f1fa8c",
-        "sep": "#44475a",
-        "accent": "#bd93f9",
-        "prefix": "#ff5555",
-        "copy_mode": "#ffb86c",
-        "warn": "#f1fa8c",
-        "alert": "#ff5555",
-        "peach": "#ffb86c",
-        "info": "#8be9fd",
-        "border": "#44475a",
-        "active_border": "#bd93f9",
-        "message_bg": "#282a36",
-        "mode_bg": "#44475a",
-    },
-    "solarized-dark": {
-        "name": "Solarized Dark",
-        "description": "Precision color system designed for solar contrast",
-        "bg": "default",
-        "fg": "#93a1a1",
-        "dim": "#586e75",
-        "val": "#839496",
-        "sep": "#073642",
-        "accent": "#268bd2",
-        "prefix": "#dc322f",
-        "copy_mode": "#b58900",
-        "warn": "#b58900",
-        "alert": "#dc322f",
-        "peach": "#cb4b16",
-        "info": "#2aa198",
-        "border": "#073642",
-        "active_border": "#268bd2",
-        "message_bg": "#002b36",
-        "mode_bg": "#073642",
-    },
-    "one-dark": {
-        "name": "One Dark",
-        "description": "Atom and VS Code iconic balanced dark theme",
-        "bg": "default",
-        "fg": "#abb2bf",
-        "dim": "#5c6370",
-        "val": "#e5c07b",
-        "sep": "#3e4451",
-        "accent": "#61afef",
-        "prefix": "#e06c75",
-        "copy_mode": "#d19a66",
-        "warn": "#e5c07b",
-        "alert": "#e06c75",
-        "peach": "#d19a66",
-        "info": "#56b6c2",
-        "border": "#282c34",
-        "active_border": "#61afef",
-        "message_bg": "#21252b",
-        "mode_bg": "#3e4451",
-    },
-    "monokai-pro": {
-        "name": "Monokai Pro",
-        "description": "Modernized high-contrast spectrum on charcoal",
-        "bg": "default",
-        "fg": "#fcfcfa",
-        "dim": "#727072",
-        "val": "#c1c0c0",
-        "sep": "#403e41",
-        "accent": "#78dce8",
-        "prefix": "#ff6188",
-        "copy_mode": "#ffd866",
-        "warn": "#ffd866",
-        "alert": "#ff6188",
-        "peach": "#fc9867",
-        "info": "#a9dc76",
-        "border": "#2d2a2e",
-        "active_border": "#78dce8",
-        "message_bg": "#221f22",
-        "mode_bg": "#403e41",
-    }
-}
+from __future__ import annotations
 
-GLYPH_SETS = {
-    "nerd": {
-        "name": "Nerd Fonts",
-        "accent": "▌",
-        "thermal": "",
-        "sleep": "",
-        "disk": "",
-        "battery_full": "",
-        "battery_mid": "",
-        "battery_low": "",
-        "cpu": "",
-        "memory": "󰍛",
-        "clients": "",
-        "sep": " · ",
-    },
-    "unicode": {
-        "name": "Unicode / Clean",
-        "accent": "▌",
-        "thermal": "▲",
-        "sleep": "☾",
-        "disk": "⛁",
-        "battery_full": "⚡",
-        "battery_mid": "⚡",
-        "battery_low": "⚡",
-        "cpu": "⚙",
-        "memory": "▤",
-        "clients": "👥",
-        "sep": " • ",
-    },
-    "ascii": {
-        "name": "Plain ASCII",
-        "accent": "|",
-        "thermal": "THR",
-        "sleep": "SLP",
-        "disk": "DSK",
-        "battery_full": "BAT",
-        "battery_mid": "BAT",
-        "battery_low": "BAT",
-        "cpu": "CPU",
-        "memory": "MEM",
-        "clients": "USR",
-        "sep": " | ",
-    }
-}
+import re
+from pathlib import Path
+from typing import Dict, List
+
+REPO_ROOT = Path(__file__).resolve().parent.parent
+THEMES_DIR = REPO_ROOT / "themes"
+GLYPHS_DIR = REPO_ROOT / "glyphs"
+
+PALETTE_KEYS = (
+    "name",
+    "description",
+    "bg",
+    "fg",
+    "dim",
+    "val",
+    "sep",
+    "accent",
+    "prefix",
+    "copy_mode",
+    "warn",
+    "alert",
+    "peach",
+    "info",
+    "border",
+    "active_border",
+    "message_bg",
+    "mode_bg",
+)
+
+GLYPH_KEYS = (
+    "name",
+    "accent",
+    "sep",
+    "thermal",
+    "sleep",
+    "disk",
+    "battery_full",
+    "battery_mid",
+    "battery_low",
+    "cpu",
+    "memory",
+    "clients",
+)
+
+_KEY_RE = re.compile(r"[a-z0-9_]+")
+
+
+class DataFileError(Exception):
+    """A palette or glyph file is missing or incomplete."""
+
+
+def parse_kv_file(path: Path) -> Dict[str, str]:
+    """Parse the CONTRACT SS1 ``key=value`` grammar.
+
+    Only the terminating LF/CR is stripped: trailing whitespace inside a value is
+    significant (``sep`` is literally ``" . "`` with both padding spaces).
+    """
+    try:
+        text = path.read_text(encoding="utf-8")
+    except OSError as exc:
+        raise DataFileError(f"cannot read {path}: {exc}") from exc
+
+    out: Dict[str, str] = {}
+    for raw in text.split("\n"):
+        line = raw.rstrip("\r")
+        if not line or line.startswith("#"):
+            continue
+        key, sep, value = line.partition("=")
+        if not sep or not _KEY_RE.fullmatch(key):
+            continue
+        out[key] = value
+    return out
+
+
+def _require(path: Path, data: Dict[str, str], keys, kind: str) -> Dict[str, str]:
+    missing = [k for k in keys if k not in data]
+    if missing:
+        raise DataFileError(
+            f"{path} is not a valid {kind}: missing key(s) {', '.join(missing)}"
+        )
+    return data
+
+
+def list_themes() -> List[str]:
+    """Filename stems of every available palette, sorted."""
+    if not THEMES_DIR.is_dir():
+        return []
+    return sorted(p.stem for p in THEMES_DIR.glob("*.palette"))
+
+
+def list_glyph_modes() -> List[str]:
+    if not GLYPHS_DIR.is_dir():
+        return []
+    return sorted(p.stem for p in GLYPHS_DIR.glob("*.glyphs"))
+
+
+_palette_cache: Dict[str, Dict[str, str]] = {}
+_glyph_cache: Dict[str, Dict[str, str]] = {}
+
+
+def load_palette(stem: str) -> Dict[str, str]:
+    cached = _palette_cache.get(stem)
+    if cached is not None:
+        return cached
+    path = THEMES_DIR / f"{stem}.palette"
+    if not path.is_file():
+        available = ", ".join(list_themes()) or "(none found)"
+        raise DataFileError(f"unknown theme {stem!r}; available: {available}")
+    data = _require(path, parse_kv_file(path), PALETTE_KEYS, "palette")
+    _palette_cache[stem] = data
+    return data
+
+
+def load_glyphs(mode: str) -> Dict[str, str]:
+    cached = _glyph_cache.get(mode)
+    if cached is not None:
+        return cached
+    path = GLYPHS_DIR / f"{mode}.glyphs"
+    if not path.is_file():
+        available = ", ".join(list_glyph_modes()) or "(none found)"
+        raise DataFileError(f"unknown glyph mode {mode!r}; available: {available}")
+    data = _require(path, parse_kv_file(path), GLYPH_KEYS, "glyph set")
+    _glyph_cache[mode] = data
+    return data
+
+
+def all_palettes() -> Dict[str, Dict[str, str]]:
+    return {stem: load_palette(stem) for stem in list_themes()}

@@ -1,337 +1,760 @@
-"""Main CLI dispatcher for tmux-sentinel."""
+"""Command line front end for tmux-sentinel.
+
+Python generates nothing and stores no configuration of its own: every setting is
+a tmux option (CONTRACT SS5), every artifact is produced by ``scripts/generate.sh``
+and the bar itself is rendered only by ``bin/sentinel-status``.
+
+Data goes to stdout.  Every diagnostic, warning and confirmation goes to stderr.
+"""
+
+from __future__ import annotations
 
 import argparse
-import json
 import os
+import re
 import shutil
 import subprocess
 import sys
+import time
 from pathlib import Path
+from typing import List, Optional, Tuple
 
-from .config import load_config, save_config, CONFIG_DIR, TMUX_CONF_FILE, ENV_FILE
-from .themes import THEMES, GLYPH_SETS
-from .generator import generate_all, get_repo_dir
-from .renderer import render_preview_bar, hex_to_rgb
+from . import options as O
+from . import renderer
+from . import themes
+
+VERSION = O.VERSION
+
+BEGIN_MARK = "# >>> tmux-sentinel >>>"
+END_MARK = "# <<< tmux-sentinel <<<"
+
+OK = "ok"
+WARN = "warn"
+FAIL = "FAIL"
 
 
-def cmd_tui(args):
-    """Launch the interactive curses TUI customizer."""
+def err(msg: str) -> None:
+    print(msg, file=sys.stderr)
+
+
+def note(msg: str) -> None:
+    print(f"sentinel: {msg}", file=sys.stderr)
+
+
+def out(msg: str = "") -> None:
+    print(msg)
+
+
+# --------------------------------------------------------------------------- #
+# shared helpers
+# --------------------------------------------------------------------------- #
+
+
+def _report_apply(result: O.ApplyResult) -> int:
+    for line in result.notes:
+        note(line)
+    for line in result.errors:
+        err(f"sentinel: error: {line}")
+    return 0 if result.ok else 1
+
+
+def _commit(opts: O.Options, summary: str) -> int:
+    result = opts.commit()
+    rc = _report_apply(result)
+    if rc == 0:
+        note(summary)
+    else:
+        err("sentinel: settings were persisted but applying them failed")
+    return rc
+
+
+def _tmux_conf_path() -> Path:
+    """The tmux config to edit: an existing one if there is one, else ~/.tmux.conf."""
+    home_conf = Path.home() / ".tmux.conf"
+    xdg = os.environ.get("XDG_CONFIG_HOME")
+    candidates = [home_conf]
+    if xdg:
+        candidates.append(Path(xdg) / "tmux" / "tmux.conf")
+    else:
+        candidates.append(Path.home() / ".config" / "tmux" / "tmux.conf")
+    for path in candidates:
+        if path.exists():
+            return path
+    return home_conf
+
+
+# --------------------------------------------------------------------------- #
+# customize / tui
+# --------------------------------------------------------------------------- #
+
+
+def cmd_tui(args: argparse.Namespace) -> int:
     from .tui import start_tui
-    start_tui()
+
+    return start_tui()
 
 
-def cmd_preview(args):
-    """Render a real-time ANSI preview bar in terminal."""
-    cfg = load_config()
-    if args.theme:
-        if args.theme not in THEMES:
-            print(f"Error: Unknown theme '{args.theme}'. Available: {', '.join(THEMES.keys())}")
-            sys.exit(1)
-        cfg["theme"] = args.theme
+# --------------------------------------------------------------------------- #
+# preview
+# --------------------------------------------------------------------------- #
 
-    width = shutil.get_terminal_size((80, 24)).columns
+
+def cmd_preview(args: argparse.Namespace) -> int:
+    opts = O.load()
+    if getattr(args, "theme", None):
+        opts.stage("theme", args.theme)
+    if getattr(args, "glyphs", None):
+        opts.stage("glyphs", args.glyphs)
+
+    width = args.width or shutil.get_terminal_size((80, 24)).columns
     session = args.session or "main"
+    sims = (args.sim,) if args.sim != "both" else renderer.SIM_STATES
 
-    print("\n" + "=" * width)
-    print("  TMUX-SENTINEL LIVE PREVIEW")
-    print("=" * width + "\n")
+    palette = themes.load_palette(opts.get("theme"))
+    glyphs = themes.load_glyphs(opts.get("glyphs"))
 
-    print("Steady State (Healthy):")
-    bar_healthy = render_preview_bar(cfg, width=width, session_name=session, sim_state={
-        "thermal": 100,
-        "sleep_risk": False,
-        "disk_gb": 54,
-        "batt_pct": 95,
-        "batt_discharging": False,
-        "cpu_pct": 22,
-        "swap_gb": "23.3G",
-        "pressure_level": 1,
-        "multi_client": 1,
-        "time_str": "14:30",
-        "prefix_active": False,
-        "in_copy_mode": False,
-    })
-    print(bar_healthy + "\n")
-
-    print("Alert State (Thermal Throttle, Sleep Risk, Low Disk, Discharging Batt, High CPU):")
-    bar_alert = render_preview_bar(cfg, width=width, session_name=session, sim_state={
-        "thermal": 82,
-        "sleep_risk": True,
-        "disk_gb": 12,
-        "batt_pct": 18,
-        "batt_discharging": True,
-        "cpu_pct": 94,
-        "swap_gb": "24.1G",
-        "pressure_level": 4,
-        "multi_client": 2,
-        "time_str": "14:30",
-        "prefix_active": False,
-        "in_copy_mode": False,
-    })
-    print(bar_alert + "\n")
-    print(f"Theme: {THEMES[cfg.get('theme', 'catppuccin-mocha')]['name']} | Glyphs: {cfg.get('glyph_mode', 'nerd')} | Position: {cfg.get('position', 'top')}\n")
+    header = (f"{palette['name']} | glyphs: {glyphs['name']} | "
+              f"position: {opts.get('position')} | "
+              f"alerts_only: {opts.get('alerts_only')}")
+    out(renderer.truncate_to_width(header, width))
+    out()
+    for sim in sims:
+        bar = renderer.render_preview_bar(
+            opts, width=width, sim=sim, session_name=session
+        )
+        measured = renderer.preview_width(bar)
+        out(renderer.truncate_to_width(f"{sim} ({measured} of {width} cols):",
+                                       width))
+        out(bar)
+        out()
+    return 0
 
 
-def cmd_theme(args):
-    """List themes or set the active theme."""
-    cfg = load_config()
+# --------------------------------------------------------------------------- #
+# theme
+# --------------------------------------------------------------------------- #
+
+
+def cmd_theme(args: argparse.Namespace) -> int:
+    opts = O.load()
     if not args.name:
-        curr = cfg.get("theme", "catppuccin-mocha")
-        print("\nAvailable Themes:")
-        print("─────────────────")
-        for k, v in THEMES.items():
-            marker = " ● (active)" if k == curr else "  "
-            # Color swatch preview
-            r, g, b = hex_to_rgb(v["accent"])
-            swatch = f"\033[38;2;{r};{g};{b}m██\033[0m"
-            print(f"{marker} {swatch} {k:<22} ── {v['name']}: {v['description']}")
-        print(f"\nRun `sentinel theme <name>` to apply a theme.\n")
-        return
+        current = opts.get("theme")
+        for stem in themes.list_themes():
+            palette = themes.load_palette(stem)
+            r, g, b = renderer.hex_to_rgb(palette["accent"])
+            swatch = f"\033[38;2;{r};{g};{b}m\u2588\u2588\033[0m"
+            marker = "*" if stem == current else " "
+            out(f"{marker} {swatch} {stem:<22} {palette['name']} "
+                f"- {palette['description']}")
+        note("run `sentinel theme <name>` to apply one")
+        return 0
 
-    name = args.name.lower()
-    if name not in THEMES:
-        print(f"Error: Unknown theme '{name}'. Available: {', '.join(THEMES.keys())}")
-        sys.exit(1)
-
-    cfg["theme"] = name
-    save_config(cfg)
-    generate_all(cfg)
-    _reload_tmux()
-    print(f"✓ Theme set to '{THEMES[name]['name']}' and applied to tmux.")
+    opts.stage("theme", args.name)
+    return _commit(opts, f"theme set to {args.name}")
 
 
-def cmd_toggle(args):
-    """Toggle a status segment on/off."""
-    cfg = load_config()
-    seg = args.segment.lower()
-    segs = cfg.setdefault("segments", {})
-    if seg not in segs:
-        valid = ", ".join(segs.keys())
-        print(f"Error: Unknown segment '{seg}'. Valid segments: {valid}")
-        sys.exit(1)
-
-    curr = segs.get(seg, True)
-    segs[seg] = not curr
-    save_config(cfg)
-    generate_all(cfg)
-    _reload_tmux()
-    print(f"✓ Segment '{seg}' is now {'ENABLED' if not curr else 'DISABLED'} and reloaded.")
+# --------------------------------------------------------------------------- #
+# toggle / set / get
+# --------------------------------------------------------------------------- #
 
 
-def cmd_set(args):
-    """Set a configuration value."""
-    cfg = load_config()
-    key = args.key.lower()
-    val = args.value
-
-    if key == "position":
-        if val not in ("top", "bottom"):
-            print("Error: position must be 'top' or 'bottom'")
-            sys.exit(1)
-        cfg["position"] = val
-    elif key == "glyph_mode":
-        if val not in GLYPH_SETS:
-            print(f"Error: glyph_mode must be one of: {', '.join(GLYPH_SETS.keys())}")
-            sys.exit(1)
-        cfg["glyph_mode"] = val
-    elif key == "alerts_only":
-        cfg["alerts_only"] = val.lower() in ("1", "true", "yes", "on")
-    elif key == "interval":
-        try:
-            cfg["interval"] = int(val)
-        except ValueError:
-            print("Error: interval must be an integer (seconds)")
-            sys.exit(1)
-    elif key == "windows_mode":
-        if val not in ("hidden", "minimal", "tabs"):
-            print("Error: windows_mode must be 'hidden', 'minimal', or 'tabs'")
-            sys.exit(1)
-        cfg.setdefault("windows", {})["mode"] = val
-    else:
-        print(f"Error: Unknown setting key '{key}'. (Available: position, glyph_mode, alerts_only, interval, windows_mode)")
-        sys.exit(1)
-
-    save_config(cfg)
-    generate_all(cfg)
-    _reload_tmux()
-    print(f"✓ Set {key} = {val} and reloaded tmux.")
+def cmd_toggle(args: argparse.Namespace) -> int:
+    opts = O.load()
+    enabled = opts.toggle_segment(args.segment)
+    state = "enabled" if enabled else "disabled"
+    return _commit(opts, f"segment {args.segment} {state}")
 
 
-def cmd_get(args):
-    """Print configuration as JSON."""
-    cfg = load_config()
+def cmd_set(args: argparse.Namespace) -> int:
+    opts = O.load()
+    opts.stage(args.key, args.value)
+    return _commit(opts, f"{args.key} = {args.value}")
+
+
+def cmd_get(args: argparse.Namespace) -> int:
+    opts = O.load()
     if args.key:
-        print(json.dumps(cfg.get(args.key), indent=2))
+        value = opts.get(args.key)
+        out(value)
+        if args.verbose:
+            note(f"{args.key} resolved from {opts.origin(args.key)}")
+        return 0
+    for key in O.KEYS:
+        if args.verbose:
+            out(f"{key}={opts.get(key)}\t# {opts.origin(key)}")
+        else:
+            out(f"{key}={opts.get(key)}")
+    return 0
+
+
+# --------------------------------------------------------------------------- #
+# apply
+# --------------------------------------------------------------------------- #
+
+
+def cmd_apply(args: argparse.Namespace) -> int:
+    O.load()  # surfaces invalid options and migrates legacy config first
+    return _report_apply(O.apply_all())
+
+
+# --------------------------------------------------------------------------- #
+# install / uninstall
+# --------------------------------------------------------------------------- #
+
+
+def _backup(path: Path) -> Path:
+    stamp = time.strftime("%Y%m%d%H%M%S")
+    backup = path.with_name(path.name + f".sentinel-backup-{stamp}")
+    shutil.copy2(path, backup)
+    return backup
+
+
+def _install_block() -> str:
+    return (
+        f"{BEGIN_MARK}\n"
+        f"source-file {O.SENTINEL_CONF}\n"
+        f"{END_MARK}\n"
+    )
+
+
+def cmd_install(args: argparse.Namespace) -> int:
+    conf = _tmux_conf_path()
+    block = _install_block()
+    content = conf.read_text(encoding="utf-8") if conf.exists() else ""
+    already = BEGIN_MARK in content
+
+    if already:
+        out(f"{conf} already contains this block:")
+    elif args.dry_run:
+        out(f"would add this block to {conf}:")
     else:
-        print(json.dumps(cfg, indent=2))
+        out(f"adding this block to {conf}:")
+    for line in block.rstrip("\n").split("\n"):
+        out("  " + line)
+
+    if args.dry_run:
+        note("dry run: no files were written, nothing was reloaded")
+        return 0
+
+    if not already:
+        if conf.exists():
+            backup = _backup(conf)
+            note(f"backed up {conf} to {backup}")
+            sep = "" if content.endswith("\n") or content == "" else "\n"
+            new = content + sep + "\n" + block
+        else:
+            conf.parent.mkdir(parents=True, exist_ok=True)
+            new = block
+        O._atomic_write(conf, new)
+        note(f"wrote {conf}")
+
+    return _report_apply(O.apply_all())
 
 
-def cmd_apply(args):
-    """Regenerate configs from JSON and reload tmux."""
-    cfg = load_config()
-    generate_all(cfg)
-    _reload_tmux()
-    print("✓ tmux-sentinel: Configuration regenerated and tmux reloaded live.")
+def _strip_block(content: str) -> Tuple[str, bool]:
+    lines = content.split("\n")
+    kept: List[str] = []
+    inside = False
+    removed = False
+    conf_line = f"source-file {O.SENTINEL_CONF}"
+    for line in lines:
+        if line.strip() == BEGIN_MARK:
+            inside = True
+            removed = True
+            continue
+        if inside:
+            if line.strip() == END_MARK:
+                inside = False
+            continue
+        if line.strip() == conf_line:
+            removed = True
+            continue
+        kept.append(line)
+    return "\n".join(kept), removed
 
 
-def cmd_generate(args):
-    """Generate configuration files without reloading tmux."""
-    cfg = load_config()
-    generate_all(cfg)
-    print(f"✓ Generated {TMUX_CONF_FILE} and {ENV_FILE}")
+def cmd_uninstall(args: argparse.Namespace) -> int:
+    conf = _tmux_conf_path()
+    removed_any = False
+
+    if conf.exists():
+        content = conf.read_text(encoding="utf-8")
+        new, removed = _strip_block(content)
+        if removed:
+            if args.dry_run:
+                note(f"would remove the tmux-sentinel block from {conf}")
+            else:
+                backup = _backup(conf)
+                note(f"backed up {conf} to {backup}")
+                O._atomic_write(conf, new)
+                note(f"removed the tmux-sentinel block from {conf}")
+            removed_any = True
+        else:
+            note(f"{conf} contains no tmux-sentinel block")
+    else:
+        note(f"{conf} does not exist")
+
+    generated = [O.SENTINEL_CONF, O.STATE_FILE, O.CONFIG_DIR / "env.sh"]
+    for path in generated:
+        if not path.exists():
+            continue
+        if args.dry_run:
+            note(f"would remove {path}")
+        else:
+            path.unlink()
+            note(f"removed {path}")
+        removed_any = True
+
+    keep = _decide_keep_options(args)
+    if O.OPTIONS_CONF.exists():
+        if keep:
+            note(f"kept your settings in {O.OPTIONS_CONF} "
+                 "(pass --purge to delete them)")
+        elif args.dry_run:
+            note(f"would remove {O.OPTIONS_CONF}")
+        else:
+            O.OPTIONS_CONF.unlink()
+            note(f"removed {O.OPTIONS_CONF}")
+
+    if args.dry_run:
+        note("dry run: nothing was written or reloaded")
+        return 0
+
+    if not removed_any:
+        note("nothing to uninstall")
+        return 0
+
+    if not O.server_running():
+        note("no tmux server running; nothing to reload")
+    elif conf.exists():
+        rc, _stdout, stderr = O.tmux("source-file", str(conf))
+        if rc != 0:
+            err(f"sentinel: error: tmux source-file {conf}: "
+                f"{stderr.strip() or f'exit {rc}'}")
+            return 1
+        O.tmux("refresh-client", "-S")
+        note("reloaded tmux")
+    return 0
 
 
-def cmd_doctor(args):
-    """Run diagnostic checks on environment and setup."""
-    print("\n🔍 TMUX-SENTINEL DOCTOR")
-    print("───────────────────────")
+def _decide_keep_options(args: argparse.Namespace) -> bool:
+    if args.purge:
+        return False
+    if args.keep_options:
+        return True
+    if not O.OPTIONS_CONF.exists():
+        return True
+    if not sys.stdin.isatty():
+        return True
+    answer = input(f"Delete your saved settings at {O.OPTIONS_CONF}? [y/N] ")
+    return answer.strip().lower() not in ("y", "yes")
 
-    # Tmux check
+
+# --------------------------------------------------------------------------- #
+# doctor
+# --------------------------------------------------------------------------- #
+
+
+class Report:
+    def __init__(self) -> None:
+        self.rows: List[Tuple[str, str, str]] = []
+
+    def add(self, status: str, name: str, detail: str = "") -> None:
+        self.rows.append((status, name, detail))
+
+    @property
+    def failed(self) -> bool:
+        return any(status == FAIL for status, _n, _d in self.rows)
+
+    def emit(self) -> None:
+        for status, name, detail in self.rows:
+            mark = {OK: "  ok  ", WARN: " warn ", FAIL: " FAIL "}[status]
+            out(f"[{mark}] {name}" + (f": {detail}" if detail else ""))
+
+
+def _status_right_command(conf_text: str) -> Optional[str]:
+    """Extract the shell command from the generated ``status-right`` ``#()``."""
+    for line in conf_text.split("\n"):
+        if "status-right" not in line:
+            continue
+        start = line.find("#(")
+        if start < 0:
+            continue
+        depth = 0
+        for idx in range(start + 1, len(line)):
+            if line[idx] == "(":
+                depth += 1
+            elif line[idx] == ")":
+                depth -= 1
+                if depth == 0:
+                    return line[start + 2:idx]
+    return None
+
+
+_FORMAT_RE = re.compile(r"#\{[^}]*\}")
+
+
+def _expand_tmux_formats(command: str) -> str:
+    """Resolve ``#{...}`` placeholders so the command can run under a plain sh.
+
+    tmux expands these before invoking the shell; ``sh`` would treat the ``#``
+    as a comment and silently swallow the rest of the line, which is exactly the
+    kind of "looks fine, produces nothing" failure doctor exists to catch.
+    """
+    def substitute(match: "re.Match[str]") -> str:
+        placeholder = match.group(0)
+        rc, stdout, _err = O.tmux("display-message", "-p", placeholder)
+        value = stdout.strip() if rc == 0 else ""
+        return value or "1"
+
+    return _FORMAT_RE.sub(substitute, command)
+
+
+def _tput_colors() -> Optional[int]:
+    exe = shutil.which("tput")
+    if not exe:
+        return None
+    proc = subprocess.run([exe, "colors"], capture_output=True, text=True)
+    try:
+        return int(proc.stdout.strip(), 10)
+    except ValueError:
+        return None
+
+
+def cmd_doctor(args: argparse.Namespace) -> int:
+    if args.fix:
+        note("--fix: regenerating artifacts")
+        ok, detail = O.run_generate()
+        if not ok:
+            err(f"sentinel: error: {detail}")
+        elif detail:
+            note(detail)
+        conf = _tmux_conf_path()
+        content = conf.read_text(encoding="utf-8") if conf.exists() else ""
+        if BEGIN_MARK not in content:
+            note(f"--fix: linking sentinel into {conf}")
+            fix_args = argparse.Namespace(dry_run=False)
+            cmd_install(fix_args)
+        reloaded, rerr, running = O.reload_tmux()
+        if not reloaded and rerr:
+            err(f"sentinel: error: tmux reload failed: {rerr}")
+        elif not running:
+            note("--fix: no tmux server running; skipped reload")
+
+    report = Report()
+
+    # -- tmux ----------------------------------------------------------------
     tmux_path = shutil.which("tmux")
     if tmux_path:
-        ver = subprocess.run(["tmux", "-V"], capture_output=True, text=True).stdout.strip()
-        print(f"  ✓ tmux found: {ver} ({tmux_path})")
+        rc, stdout, _e = O.tmux("-V")
+        report.add(OK if rc == 0 else FAIL, "tmux",
+                   f"{stdout.strip() or 'unknown version'} ({tmux_path})")
     else:
-        print("  ✗ tmux not found in PATH")
+        report.add(FAIL, "tmux", "not found in PATH")
 
-    # OS check
-    os_name = subprocess.run(["uname", "-s"], capture_output=True, text=True).stdout.strip()
-    print(f"  ✓ Operating System: {os_name}")
+    running = O.server_running()
+    report.add(OK if running else WARN, "tmux server",
+               "responding" if running else "no server running on this socket")
 
-    # C helper check
-    repo_dir = get_repo_dir()
-    bin_cpu = repo_dir / "bin" / "mac-cpu-pct"
-    local_cpu = Path.home() / ".local" / "bin" / "mac-cpu-pct"
-    if bin_cpu.exists() and os.access(bin_cpu, os.X_OK):
-        print(f"  ✓ mac-cpu-pct binary found in repo: {bin_cpu}")
-    elif local_cpu.exists() and os.access(local_cpu, os.X_OK):
-        print(f"  ✓ mac-cpu-pct binary found in ~/.local/bin: {local_cpu}")
-    elif os_name == "Darwin":
-        print("  ! mac-cpu-pct binary not compiled (will use sysctl fallback). Run `make -C src` to build.")
+    uname = subprocess.run(["uname", "-sm"], capture_output=True, text=True)
+    report.add(OK, "platform", uname.stdout.strip())
 
-    # Config files check
-    print(f"  ✓ Config directory: {CONFIG_DIR}")
-    print(f"    - config.json:  {'[FOUND]' if (CONFIG_DIR / 'config.json').exists() else '[NOT CREATED - using defaults]'}")
-    print(f"    - sentinel.conf: {'[FOUND]' if TMUX_CONF_FILE.exists() else '[NOT CREATED - run `sentinel generate`]'}")
-    print(f"    - env.sh:        {'[FOUND]' if ENV_FILE.exists() else '[NOT CREATED - run `sentinel generate`]'}")
-
-    # tmux.conf check
-    tmux_conf = Path.home() / ".tmux.conf"
-    if tmux_conf.exists():
-        content = tmux_conf.read_text(encoding="utf-8")
-        if "sentinel" in content or "statusbar.conf" in content:
-            print(f"  ✓ ~/.tmux.conf has statusbar integration")
-        else:
-            print(f"  ! ~/.tmux.conf does not source sentinel.conf. Run `sentinel install` to link.")
-    print()
-
-
-def cmd_install(args):
-    """Link sentinel.conf into ~/.tmux.conf."""
-    cfg = load_config()
-    generate_all(cfg)
-
-    tmux_conf = Path.home() / ".tmux.conf"
-    source_line = f"source-file {TMUX_CONF_FILE}"
-
-    if tmux_conf.exists():
-        content = tmux_conf.read_text(encoding="utf-8")
-        if source_line in content or str(TMUX_CONF_FILE) in content:
-            print(f"✓ ~/.tmux.conf already sources {TMUX_CONF_FILE}")
-            _reload_tmux()
-            return
-
-        # Replace old statusbar.conf line if present
-        if "source-file ~/.config/tmux/statusbar.conf" in content:
-            content = content.replace("source-file ~/.config/tmux/statusbar.conf", source_line)
-            tmux_conf.write_text(content, encoding="utf-8")
-            print(f"✓ Replaced old statusbar.conf with {source_line} in ~/.tmux.conf")
-        else:
-            with open(tmux_conf, "a", encoding="utf-8") as f:
-                f.write(f"\n# tmux-sentinel status bar\n{source_line}\n")
-            print(f"✓ Added '{source_line}' to ~/.tmux.conf")
-    else:
-        tmux_conf.write_text(f"# tmux-sentinel status bar\n{source_line}\n", encoding="utf-8")
-        print(f"✓ Created ~/.tmux.conf with '{source_line}'")
-
-    _reload_tmux()
-    print("✓ Installation complete! Tmux status bar is active.")
-
-
-def _reload_tmux():
+    # -- options -------------------------------------------------------------
     try:
-        if TMUX_CONF_FILE.exists():
-            subprocess.run(["tmux", "source-file", str(TMUX_CONF_FILE)], capture_output=True)
-            subprocess.run(["tmux", "refresh-client", "-S"], capture_output=True)
-    except Exception:
-        pass
+        opts = O.load(quiet=False)
+        persisted = O.read_options_conf()
+        report.add(OK, "options.conf",
+                   f"{O.OPTIONS_CONF} ({len(persisted)} setting(s) persisted)"
+                   if O.OPTIONS_CONF.exists()
+                   else f"{O.OPTIONS_CONF} absent; using defaults")
+    except O.ConfigError as exc:
+        report.add(FAIL, "options.conf", str(exc).replace("\n", " "))
+        report.emit()
+        return 1
+
+    # -- engine binary -------------------------------------------------------
+    engine_ok = False
+    try:
+        binary = O.status_binary()
+        proc = O.run_engine(["--version"])
+        if proc.returncode == 0:
+            report.add(OK, "engine", f"{proc.stdout.strip()} ({binary})")
+            engine_ok = True
+        else:
+            report.add(FAIL, "engine",
+                       f"{binary} --version exited {proc.returncode}: "
+                       f"{proc.stderr.strip()}")
+    except O.EngineMissing as exc:
+        report.add(FAIL, "engine", str(exc).replace("\n", " ").strip())
+
+    # -- selftest ------------------------------------------------------------
+    if engine_ok:
+        proc = O.run_engine(["--selftest"], timeout=10)
+        lines = [ln for ln in proc.stdout.split("\n") if ln.strip()]
+        report.add(OK if proc.returncode == 0 else FAIL, "engine selftest",
+                   f"{len(lines)} segment(s) probed, exit {proc.returncode}")
+        for line in lines:
+            name, _sep, rest = line.partition(":")
+            failed = rest.strip().lower().endswith(("failed", "error", "fail"))
+            report.add(FAIL if failed else OK, f"  segment {name.strip()}",
+                       rest.strip())
+        if proc.stderr.strip():
+            report.add(WARN, "  selftest stderr", proc.stderr.strip())
+
+    # -- generated conf ------------------------------------------------------
+    if not O.SENTINEL_CONF.exists():
+        report.add(FAIL, "sentinel.conf",
+                   f"{O.SENTINEL_CONF} missing; run `sentinel apply` "
+                   "(or `sentinel doctor --fix`)")
+    else:
+        conf_text = O.SENTINEL_CONF.read_text(encoding="utf-8")
+        report.add(OK, "sentinel.conf", str(O.SENTINEL_CONF))
+        command = _status_right_command(conf_text)
+        if command is None:
+            report.add(FAIL, "status-right",
+                       "no #(...) command found in the generated conf")
+        else:
+            reduced = "status-fallback" in command
+            report.add(WARN if reduced else OK, "renderer",
+                       "reduced shell fallback active (disk/cpu/memory/clock only); "
+                       "run `make` to build the native engine"
+                       if reduced else "native engine")
+            runnable = _expand_tmux_formats(command)
+            proc = subprocess.run(
+                ["sh", "-c", runnable], capture_output=True, text=True, timeout=15
+            )
+            if proc.returncode != 0:
+                report.add(FAIL, "status-right exec",
+                           f"exit {proc.returncode}: "
+                           f"{proc.stderr.strip() or 'no stderr'}")
+            elif not proc.stdout.strip():
+                report.add(FAIL, "status-right exec",
+                           "command produced no output; the bar would be empty")
+            else:
+                text = renderer.plain_text(proc.stdout)
+                report.add(OK, "status-right exec",
+                           f"{len(proc.stdout)} bytes, renders {text.strip()!r}")
+
+        if running:
+            rc, _o, stderr = O.tmux("source-file", str(O.SENTINEL_CONF))
+            if rc != 0:
+                report.add(FAIL, "tmux source-file",
+                           stderr.strip() or f"exit {rc}")
+            elif stderr.strip():
+                report.add(WARN, "tmux source-file", stderr.strip())
+            else:
+                report.add(OK, "tmux source-file", "accepted with no complaints")
+
+    # -- state file ----------------------------------------------------------
+    if not O.STATE_FILE.exists():
+        report.add(FAIL, "sentinel.state",
+                   f"{O.STATE_FILE} missing; run `sentinel apply`")
+    else:
+        on_disk = O.parse_state(O.STATE_FILE.read_text(encoding="utf-8"))
+        if on_disk.get("version") != "1":
+            report.add(FAIL, "sentinel.state",
+                       f"version={on_disk.get('version')!r}, expected 1")
+        else:
+            expected = O.parse_state(O.state_text(opts))
+            drift = sorted(
+                k for k in set(expected) | set(on_disk)
+                if expected.get(k) != on_disk.get(k)
+            )
+            if drift:
+                report.add(FAIL, "sentinel.state",
+                           "disagrees with the live options for: "
+                           + ", ".join(drift)
+                           + " (run `sentinel apply`)")
+            else:
+                report.add(OK, "sentinel.state",
+                           f"{len(on_disk)} keys, agrees with the live options")
+
+    # -- ~/.tmux.conf --------------------------------------------------------
+    conf = _tmux_conf_path()
+    if not conf.exists():
+        report.add(FAIL, "tmux config",
+                   f"{conf} does not exist; run `sentinel install`")
+    else:
+        content = conf.read_text(encoding="utf-8")
+        if BEGIN_MARK in content or f"source-file {O.SENTINEL_CONF}" in content:
+            report.add(OK, "tmux config", f"{conf} sources sentinel.conf")
+        elif "@sentinel_" in content:
+            report.add(OK, "tmux config",
+                       f"{conf} sets @sentinel_* options (TPM install)")
+        else:
+            report.add(FAIL, "tmux config",
+                       f"{conf} neither sources sentinel.conf nor sets "
+                       "@sentinel_* options; run `sentinel install`")
+
+    # -- terminal ------------------------------------------------------------
+    term = os.environ.get("TERM", "(unset)")
+    colors = _tput_colors()
+    report.add(OK if colors and colors >= 256 else WARN, "terminal",
+               f"TERM={term}, colors={colors if colors is not None else 'unknown'}"
+               + ("" if colors and colors >= 256
+                  else " (truecolor themes need a 256-colour terminal)"))
+
+    lang = os.environ.get("LC_ALL") or os.environ.get("LC_CTYPE") \
+        or os.environ.get("LANG") or ""
+    utf8 = "utf-8" in lang.lower() or "utf8" in lang.lower()
+    mode = opts.get("glyphs")
+    if mode == "ascii":
+        report.add(OK, "glyphs", "ascii: safe in any terminal")
+    elif not utf8:
+        report.add(FAIL, "glyphs",
+                   f"{mode} needs a UTF-8 locale but LANG/LC_CTYPE is {lang!r}; "
+                   "run `sentinel set glyphs ascii`")
+    elif mode == "nerd":
+        report.add(WARN, "glyphs",
+                   "nerd: requires a Nerd Font-patched font; if you see boxes, "
+                   "run `sentinel set glyphs unicode`")
+    else:
+        report.add(OK, "glyphs", "unicode: UTF-8 locale detected")
+
+    report.emit()
+    if report.failed:
+        err("sentinel: doctor found problems; see the FAIL lines above")
+        return 1
+    return 0
 
 
-def main():
+# --------------------------------------------------------------------------- #
+# completion
+# --------------------------------------------------------------------------- #
+
+
+def cmd_completion(args: argparse.Namespace) -> int:
+    from .completions import render_completion, write_completions
+
+    if args.write:
+        written = write_completions()
+        for path in written:
+            note(f"wrote {path}")
+        return 0
+    out(render_completion(args.shell))
+    return 0
+
+
+# --------------------------------------------------------------------------- #
+# parser
+# --------------------------------------------------------------------------- #
+
+
+def _bare(args: argparse.Namespace) -> int:
+    """No subcommand: the TUI when interactive, a preview otherwise."""
+    if sys.stdin.isatty() and sys.stdout.isatty():
+        return cmd_tui(args)
+    return cmd_preview(args)
+
+
+def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         prog="sentinel",
-        description="tmux-sentinel: Minimal, alerts-only tmux status bar customizer and engine."
+        description="tmux-sentinel: alerts-only tmux status bar, "
+                    "configured through tmux options.",
     )
-    subparsers = parser.add_subparsers(dest="command", help="Subcommand to run")
+    parser.add_argument("--version", action="version",
+                        version=f"sentinel {VERSION}")
+    # The root parser carries the defaults every handler may read, so a bare
+    # invocation cannot fail on a missing attribute.
+    parser.set_defaults(
+        func=_bare, theme=None, glyphs=None, session=None, width=None,
+        sim="both", verbose=False,
+    )
 
-    # TUI
-    sub_tui = subparsers.add_parser("customize", aliases=["tui"], help="Open interactive TUI customizer")
-    sub_tui.set_defaults(func=cmd_tui)
+    sub = parser.add_subparsers(dest="command", metavar="<command>")
 
-    # Preview
-    sub_prev = subparsers.add_parser("preview", help="Render ANSI preview of status bar in terminal")
-    sub_prev.add_argument("--theme", "-t", help="Theme to preview")
-    sub_prev.add_argument("--session", "-s", help="Simulated session name")
-    sub_prev.set_defaults(func=cmd_preview)
+    p = sub.add_parser("customize", aliases=["tui"],
+                       help="interactive curses customizer")
+    p.set_defaults(func=cmd_tui)
 
-    # Theme
-    sub_thm = subparsers.add_parser("theme", aliases=["themes"], help="List or set theme")
-    sub_thm.add_argument("name", nargs="?", help="Theme name to apply")
-    sub_thm.set_defaults(func=cmd_theme)
+    p = sub.add_parser("preview", help="render the real bar in this terminal")
+    p.add_argument("--theme", "-t", help="preview a theme without applying it")
+    p.add_argument("--glyphs", "-g", choices=list(O.GLYPH_MODES),
+                   help="preview a glyph set without applying it")
+    p.add_argument("--session", "-s", default=None,
+                   help="simulated session name")
+    p.add_argument("--width", "-w", type=int, default=None,
+                   help="bar width in columns (default: terminal width)")
+    p.add_argument("--sim", choices=["healthy", "alert", "both"],
+                   default="both", help="which simulated state to render")
+    p.set_defaults(func=cmd_preview)
 
-    # Toggle
-    sub_tog = subparsers.add_parser("toggle", help="Toggle a status segment")
-    sub_tog.add_argument("segment", help="Segment name (thermal, sleep_risk, disk, battery, cpu, memory, multi_client, clock)")
-    sub_tog.set_defaults(func=cmd_toggle)
+    p = sub.add_parser("theme", aliases=["themes"], help="list or set the theme")
+    p.add_argument("name", nargs="?", help="theme to apply")
+    p.set_defaults(func=cmd_theme)
 
-    # Set
-    sub_set = subparsers.add_parser("set", help="Set a configuration option")
-    sub_set.add_argument("key", help="Setting key (position, glyph_mode, alerts_only, interval, windows_mode)")
-    sub_set.add_argument("value", help="Value to set")
-    sub_set.set_defaults(func=cmd_set)
+    p = sub.add_parser("toggle", help="enable/disable one segment")
+    p.add_argument("segment", choices=list(O.SEGMENTS), metavar="<segment>",
+                   help="one of: " + ", ".join(O.SEGMENTS))
+    p.set_defaults(func=cmd_toggle)
 
-    # Get
-    sub_get = subparsers.add_parser("get", help="Get configuration JSON or key value")
-    sub_get.add_argument("key", nargs="?", help="Key to inspect")
-    sub_get.set_defaults(func=cmd_get)
+    p = sub.add_parser("set", help="set one setting")
+    p.add_argument("key", metavar="<key>", help="one of: " + ", ".join(O.KEYS))
+    p.add_argument("value", metavar="<value>")
+    p.set_defaults(func=cmd_set)
 
-    # Apply / Reload
-    sub_app = subparsers.add_parser("apply", aliases=["reload"], help="Regenerate configs and live reload tmux")
-    sub_app.set_defaults(func=cmd_apply)
+    p = sub.add_parser("get", help="print settings")
+    p.add_argument("key", nargs="?", metavar="<key>")
+    p.add_argument("--verbose", "-v", action="store_true",
+                   help="also report where each value came from")
+    p.set_defaults(func=cmd_get)
 
-    # Generate
-    sub_gen = subparsers.add_parser("generate", help="Generate config files without reloading tmux")
-    sub_gen.set_defaults(func=cmd_generate)
+    p = sub.add_parser("apply", aliases=["reload"],
+                       help="regenerate artifacts and reload tmux")
+    p.set_defaults(func=cmd_apply)
 
-    # Doctor
-    sub_doc = subparsers.add_parser("doctor", help="Run system diagnostics")
-    sub_doc.set_defaults(func=cmd_doctor)
+    p = sub.add_parser("doctor", help="diagnose the installation")
+    p.add_argument("--fix", action="store_true",
+                   help="regenerate artifacts and relink before diagnosing")
+    p.set_defaults(func=cmd_doctor)
 
-    # Install
-    sub_inst = subparsers.add_parser("install", help="Link sentinel into ~/.tmux.conf")
-    sub_inst.set_defaults(func=cmd_install)
+    p = sub.add_parser("install", help="source sentinel.conf from your tmux config")
+    p.add_argument("--dry-run", action="store_true",
+                   help="print the change without making it")
+    p.set_defaults(func=cmd_install)
 
-    args = parser.parse_args()
+    p = sub.add_parser("uninstall", help="remove sentinel from your tmux config")
+    p.add_argument("--dry-run", action="store_true",
+                   help="print the changes without making them")
+    p.add_argument("--keep-options", action="store_true",
+                   help="keep options.conf without asking")
+    p.add_argument("--purge", action="store_true",
+                   help="also delete options.conf")
+    p.set_defaults(func=cmd_uninstall)
 
-    if not args.command:
-        # Default with no args: launch TUI if interactive terminal, else show preview
-        if sys.stdin.isatty():
-            cmd_tui(args)
-        else:
-            cmd_preview(args)
-    else:
-        args.func(args)
+    p = sub.add_parser("completion", help="emit shell completions")
+    p.add_argument("shell", nargs="?", choices=["bash", "zsh"], default="bash")
+    p.add_argument("--write", action="store_true",
+                   help="regenerate completions/ in the repo")
+    p.set_defaults(func=cmd_completion)
+
+    return parser
+
+
+def main(argv: Optional[List[str]] = None) -> int:
+    parser = build_parser()
+    args = parser.parse_args(argv)
+    try:
+        return args.func(args) or 0
+    except O.OptionError as exc:
+        err(f"sentinel: {exc}")
+        return 2
+    except O.ConfigError as exc:
+        err(f"sentinel: error: {exc}")
+        return 1
+    except themes.DataFileError as exc:
+        err(f"sentinel: error: {exc}")
+        return 1
+    except O.EngineMissing as exc:
+        err(f"sentinel: error: {exc}")
+        return 1
+    except BrokenPipeError:
+        return 0
+    except KeyboardInterrupt:
+        err("")
+        return 130
 
 
 if __name__ == "__main__":
-    main()
+    sys.exit(main())
