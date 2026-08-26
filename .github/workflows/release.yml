@@ -4,6 +4,11 @@ on:
   push:
     tags:
       - 'v*'
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: 'Tag to build and release (e.g. v0.2.0)'
+        required: true
 
 permissions:
   contents: write
@@ -16,6 +21,8 @@ jobs:
         arch: [arm64, x86_64]
     steps:
       - uses: actions/checkout@v7.0.1
+        with:
+          ref: ${{ inputs.tag || github.ref_name }}
       - name: Build ${{ matrix.arch }} binary
         run: |
           make clean
@@ -30,6 +37,8 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v7.0.1
+        with:
+          ref: ${{ inputs.tag || github.ref_name }}
       - name: Build Linux x86_64 binary
         run: |
           make clean
@@ -45,6 +54,8 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v7.0.1
+        with:
+          ref: ${{ inputs.tag || github.ref_name }}
       - uses: actions/download-artifact@v7.0.1
         with:
           path: dist
@@ -52,7 +63,9 @@ jobs:
         run: chmod +x dist/*/sentinel-status-*
       - name: Extract changelog notes
         run: |
-          version="${GITHUB_REF_NAME#v}"
+          tag="${{ inputs.tag || github.ref_name }}"
+          echo "TAG=$tag" >> "$GITHUB_ENV"
+          version="${tag#v}"
           awk -v version="$version" '
             $0 ~ "^## \\[" version "\\]" { found=1; next }
             found && /^## / { exit }
@@ -60,5 +73,6 @@ jobs:
           ' CHANGELOG.md > release-notes.md
       - uses: softprops/action-gh-release@v3.0.2
         with:
+          tag_name: ${{ env.TAG }}
           body_path: release-notes.md
           files: dist/*/sentinel-status-*
