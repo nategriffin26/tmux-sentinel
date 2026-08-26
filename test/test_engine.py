@@ -7,6 +7,7 @@ tests are the project's load-bearing correctness checks.
 from __future__ import annotations
 
 import concurrent.futures
+import re
 import statistics
 import time
 import unittest
@@ -72,12 +73,12 @@ class TestSimulateContract(EngineTestCase):
     def test_documented_simulate_values_appear(self):
         """CONTRACT §4 pins these so docs, tests and preview agree."""
         healthy = strip_tmux(engine("--simulate", "healthy").stdout)
-        for token in ("54G", "22%", "23.3G", "14:30"):
+        for token in ("54G", "22%", "38%", "14:30"):
             with self.subTest(state="healthy", token=token):
                 self.assertIn(token, healthy)
 
         alert = strip_tmux(engine("--simulate", "alert").stdout)
-        for token in ("12G", "18%", "94%", "24.1G", "14:30", "2"):
+        for token in ("12G", "18%", "94%", "93%", "14:30", "2"):
             with self.subTest(state="alert", token=token):
                 self.assertIn(token, alert)
 
@@ -111,10 +112,12 @@ class TestLiveProbes(EngineTestCase):
 
     def test_cpu_and_memory_are_always_present(self):
         """Ambient segments per CONTRACT §3 — they are what makes the
-        healthy bar non-empty."""
+        healthy bar non-empty. Both are percentages now (cpu utilisation,
+        memory pressure), so presence is counted, not pattern-matched."""
         text = strip_tmux(engine().stdout)
-        self.assertRegex(text, r"\d+%", f"no CPU percentage in {text!r}")
-        self.assertRegex(text, r"\d+\.\d+G", f"no swap figure in {text!r}")
+        figures = re.findall(r"\d+%", text)
+        self.assertGreaterEqual(len(figures), 2,
+                                f"expected cpu and memory percentages in {text!r}")
 
     def test_multi_client_appears_only_above_one(self):
         sep = parse_kv((REPO / "glyphs" / "nerd.glyphs").read_text("utf-8"))["sep"]
@@ -152,6 +155,14 @@ class TestStateFileRobustness(EngineTestCase):
             self.assertEqual(r.returncode, 0, r.stderr)
             return r.stdout
 
+    def _simulate_raw(self, body: str, mode: str = "healthy") -> str:
+        """Render the fixed synthetic metrics, tmux colour tags intact."""
+        with ScratchHome() as home:
+            home.state.write_text(body, encoding="utf-8")
+            r = engine("--state", str(home.state), "--simulate", mode)
+            self.assertEqual(r.returncode, 0, r.stderr)
+            return r.stdout
+
     def _simulate(self, body: str, mode: str = "healthy") -> str:
         """Render the fixed synthetic metrics under a given state file.
 
@@ -159,11 +170,7 @@ class TestStateFileRobustness(EngineTestCase):
         host, whose real disk and battery figures are not the documented
         ones.
         """
-        with ScratchHome() as home:
-            home.state.write_text(body, encoding="utf-8")
-            r = engine("--state", str(home.state), "--simulate", mode)
-            self.assertEqual(r.returncode, 0, r.stderr)
-            return strip_tmux(r.stdout)
+        return strip_tmux(self._simulate_raw(body, mode))
 
     def test_missing_file_falls_back_to_builtin_defaults(self):
         r = engine("--state", "/nonexistent/sentinel.state")
@@ -213,6 +220,21 @@ class TestStateFileRobustness(EngineTestCase):
     def test_disk_resting_state_can_be_turned_off(self):
         self.assertIn("54G", self._simulate("version=1\nalways_disk=1\n"))
         self.assertNotIn("54G", self._simulate("version=1\nalways_disk=0\n"))
+
+    def test_memory_thresholds_colour_the_pressure_figure(self):
+        """Simulated healthy pressure is 38% at kernel level 1 (CONTRACT §4),
+        so the thresholds alone decide the colour there."""
+        body = "version=1\ncolor_val=VAL\ncolor_warn=WARN\ncolor_alert=ALERT\n"
+        self.assertIn("VAL]38%", self._simulate_raw(body + "memory_warn_pct=80\n"))
+        self.assertIn("WARN]38%", self._simulate_raw(body + "memory_warn_pct=30\n"))
+        self.assertIn("ALERT]38%", self._simulate_raw(body + "memory_crit_pct=30\n"))
+
+    def test_kernel_pressure_level_escalates_past_the_thresholds(self):
+        """Simulated alert is kernel level 4: the kernel's own verdict must
+        colour the segment even when the percentage is below both thresholds."""
+        body = ("version=1\ncolor_val=VAL\ncolor_warn=WARN\ncolor_alert=ALERT\n"
+                "memory_warn_pct=100\nmemory_crit_pct=100\n")
+        self.assertIn("ALERT]93%", self._simulate_raw(body, mode="alert"))
 
     def test_disk_is_visible_with_no_state_file_at_all(self):
         """Built-in defaults, not just generated ones, must show disk."""

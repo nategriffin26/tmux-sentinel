@@ -105,6 +105,8 @@ cpu_warn_pct=70
 cpu_crit_pct=90
 battery_warn_pct=50
 battery_crit_pct=20
+memory_warn_pct=80
+memory_crit_pct=90
 ```
 
 `glyph_sep` carries its own padding spaces. Since trailing whitespace in a `key=value`
@@ -155,7 +157,7 @@ so they always render and their `always_*` key is accepted but inert.
 | battery | discharging | `#[fg=C]{icon} {pct}%` |
 | battery | not discharging AND `always_battery=1` | `#[fg=DIM]{glyph_battery_full} #[fg=VAL]{pct}%` |
 | cpu | always | `#[fg=DIM]{glyph_cpu} #[fg=C]{pct}%` — pct right-aligned width 2 |
-| memory | always | `#[fg=DIM]{glyph_memory} #[fg=C]{swap}` e.g. `23.3G` |
+| memory | always | `#[fg=DIM]{glyph_memory} #[fg=C]{pct}%` — pressure, pct right-aligned width 2 |
 | multi_client | clients > 1, OR `always_multi_client=1` | `#[fg=INFO]{glyph_clients} {n}` |
 | clock | always | `#[fg=FG,bold]{strftime(clock_format)}` |
 
@@ -165,22 +167,33 @@ Colour selection (`C`):
   then `PEACH` + `glyph_battery_mid`; if `pct < battery_crit_pct` then `ALERT` +
   `glyph_battery_low`.
 - cpu: `VAL`; `PEACH` if `pct >= cpu_warn_pct`; `ALERT` if `pct >= cpu_crit_pct`.
-- memory: `VAL`; `WARN` if pressure level >= 2; `ALERT` if pressure level >= 4.
-  (Linux: `WARN` if MemAvailable/MemTotal <= 20%, `ALERT` if <= 10%.)
+- memory: `VAL`; `WARN` if `pct >= memory_warn_pct`; `ALERT` if `pct >= memory_crit_pct`.
+  On Darwin the kernel's own verdict also escalates, whatever the thresholds say:
+  `WARN` at `kern.memorystatus_vm_pressure_level >= 2`, `ALERT` at `>= 4`.
 
-Thresholds are strict as written above. `disk` uses `<`, `cpu` uses `>=`.
+Thresholds are strict as written above. `disk` uses `<`, `cpu` and `memory` use `>=`.
+
+`memory` reports **pressure**, the share of physical memory unavailable to a new
+allocation — not swap in use. Darwin reads `100 - kern.memorystatus_level`; that
+sysctl is `memorystatus_get_available_page_count() * 100 / total_pages`, the figure
+`memory_pressure(1)` prints as "System-wide memory free percentage", and it is
+refreshed by the same kernel pass that sets the discrete pressure level, so the
+number and its colour cannot disagree. Linux reads
+`100 - MemAvailable * 100 / MemTotal`, rounded to nearest, and has no kernel-side
+level. A reduced-mode bar MUST report the same quantity, so `status-fallback.sh`
+computes it from the same two sources.
 
 ## 4. `--simulate` fixed values — normative, byte-exact
 
 These exist so the golden test can assert the preview equals the engine.
 
 `--simulate healthy`: thermal nominal, sleep risk none (30 minutes armed but an
-assertion is held), disk 54 GB, battery 95% not discharging, cpu 22, swap
-`23.3G`, memory pressure 1, clients 1, clock renders the literal string `14:30`
+assertion is held), disk 54 GB, battery 95% not discharging, cpu 22, memory
+pressure `38%` at kernel level 1, clients 1, clock renders the literal string `14:30`
 (NOT current time — simulate must be deterministic; bypass strftime).
 
 `--simulate alert`: thermal `Fair`, sleep risk armed with 10 minutes, disk 12 GB,
-battery 18% discharging, cpu 94, swap `24.1G`, memory pressure 4, clients 2,
+battery 18% discharging, cpu 94, memory pressure `93%` at kernel level 4, clients 2,
 clock `14:30`.
 
 Simulate honours the loaded `always_*` flags, so `sentinel preview` shows the
@@ -211,6 +224,8 @@ as `set -ogq` lines so a user's `.tmux.conf` always wins.
 | `@sentinel_cpu_crit_pct` | `90` | integer 0..100 |
 | `@sentinel_battery_warn_pct` | `50` | integer 0..100 |
 | `@sentinel_battery_crit_pct` | `20` | integer 0..100 |
+| `@sentinel_memory_warn_pct` | `80` | integer 0..100 |
+| `@sentinel_memory_crit_pct` | `90` | integer 0..100 |
 
 **Validation is mandatory and happens in `scripts/generate.sh`.** Any value outside its
 domain is replaced by the default AND reported via `tmux display-message`. Nothing

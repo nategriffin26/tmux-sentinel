@@ -34,6 +34,7 @@ REQUIRED_STATE_KEYS = {
     "glyph_cpu", "glyph_memory", "glyph_clients",
     "disk_warn_gb", "disk_crit_gb", "cpu_warn_pct", "cpu_crit_pct",
     "battery_warn_pct", "battery_crit_pct",
+    "memory_warn_pct", "memory_crit_pct",
 } | {f"seg_{s}" for s in SEGMENTS} | {f"always_{s}" for s in SEGMENTS}
 
 

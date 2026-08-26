@@ -5,8 +5,8 @@
 **A quiet-by-default host health watchdog for your tmux status bar.**
 
 Stays silent while your machine is healthy. Surfaces thermal throttling, sleep
-risk, disk pressure, battery drain and CPU spikes the moment they matter —
-each with a number attached.
+risk, disk pressure, battery drain, memory pressure and CPU spikes the moment
+they matter — each with a number attached.
 
 [![CI](https://github.com/nategriffin26/tmux-sentinel/actions/workflows/ci.yml/badge.svg)](https://github.com/nategriffin26/tmux-sentinel/actions/workflows/ci.yml)
 [![License: MIT](https://img.shields.io/badge/license-MIT-blue.svg)](LICENSE)
@@ -109,6 +109,8 @@ they have something to report.
 | `@sentinel_cpu_crit_pct` | `90` | integer 0–100 |
 | `@sentinel_battery_warn_pct` | `50` | integer 0–100 |
 | `@sentinel_battery_crit_pct` | `20` | integer 0–100 |
+| `@sentinel_memory_warn_pct` | `80` | integer 0–100 |
+| `@sentinel_memory_crit_pct` | `90` | integer 0–100 |
 
 Every value is domain-validated before it reaches generated config. An
 out-of-range value falls back to its default and says so via
@@ -137,7 +139,7 @@ running tmux server immediately and persist to
 | **Disk** | free space below `disk_warn_gb` | **default** | gigabytes free |
 | **Battery** | discharging | opt-in | charge percent, icon and colour stepping down by threshold |
 | **CPU** | above `cpu_warn_pct` | always | utilisation from real tick deltas, not load average |
-| **Memory** | kernel memory pressure | always | swap in use |
+| **Memory** | pressure above `memory_warn_pct`, or the kernel's own warning | always | memory pressure — the share of RAM unavailable, `100 - kern.memorystatus_level` (Linux: `MemAvailable`) |
 | **Clients** | more than one attached | opt-in | client count |
 | **Clock** | — | always | your `clock_format` |
 

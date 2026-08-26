@@ -35,7 +35,7 @@ LF=$(printf '\nx')
 LF=${LF%x}
 TAB=$(printf '\t')
 
-OPTION_NAMES='theme position interval glyphs always segments windows clock_format session_max_length accent disk_warn_gb disk_crit_gb cpu_warn_pct cpu_crit_pct battery_warn_pct battery_crit_pct'
+OPTION_NAMES='theme position interval glyphs always segments windows clock_format session_max_length accent disk_warn_gb disk_crit_gb cpu_warn_pct cpu_crit_pct battery_warn_pct battery_crit_pct memory_warn_pct memory_crit_pct'
 SEGMENT_NAMES='thermal sleep_risk disk battery cpu memory multi_client clock'
 PALETTE_COLOURS='bg fg dim val sep accent prefix copy_mode warn alert peach info border active_border message_bg mode_bg'
 GLYPH_KEYS='accent sep thermal sleep disk battery_full battery_mid battery_low cpu memory clients'
@@ -371,6 +371,8 @@ check_int cpu_warn_pct 0 100
 check_int cpu_crit_pct 0 100
 check_int battery_warn_pct 0 100
 check_int battery_crit_pct 0 100
+check_int memory_warn_pct 0 100
+check_int memory_crit_pct 0 100
 
 # clock_format: strftime conversions, alphanumerics, spaces and `: / . , + -`.
 # Quotes, backslashes, `$`, `;`, `#` and control characters are all excluded.
@@ -533,6 +535,8 @@ tmp_conf=$CONFIG_DIR/.sentinel.conf.$$
 	emit cpu_crit_pct "$opt_cpu_crit_pct"
 	emit battery_warn_pct "$opt_battery_warn_pct"
 	emit battery_crit_pct "$opt_battery_crit_pct"
+	emit memory_warn_pct "$opt_memory_warn_pct"
+	emit memory_crit_pct "$opt_memory_crit_pct"
 } >"$tmp_state" || die "cannot write $tmp_state"
 
 {

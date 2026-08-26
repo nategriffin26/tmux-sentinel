@@ -214,6 +214,10 @@ SPECS: Tuple[Spec, ...] = (
          _const("50"), _no_choices),
     Spec("battery_crit_pct", "integer 0..100", _int_domain(0, 100),
          _const("20"), _no_choices),
+    Spec("memory_warn_pct", "integer 0..100", _int_domain(0, 100),
+         _const("80"), _no_choices),
+    Spec("memory_crit_pct", "integer 0..100", _int_domain(0, 100),
+         _const("90"), _no_choices),
 )
 
 SPEC_BY_KEY: Dict[str, Spec] = {s.key: s for s in SPECS}
@@ -719,6 +723,8 @@ _STATE_THRESHOLDS = (
     "cpu_crit_pct",
     "battery_warn_pct",
     "battery_crit_pct",
+    "memory_warn_pct",
+    "memory_crit_pct",
 )
 
 _GLYPH_STATE_KEYS = (

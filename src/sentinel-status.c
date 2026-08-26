@@ -60,7 +60,7 @@ struct config {
     char glyph_battery_full[33], glyph_battery_mid[33], glyph_battery_low[33];
     char glyph_cpu[33], glyph_memory[33], glyph_clients[33];
     int disk_warn_gb, disk_crit_gb, cpu_warn_pct, cpu_crit_pct;
-    int battery_warn_pct, battery_crit_pct;
+    int battery_warn_pct, battery_crit_pct, memory_warn_pct, memory_crit_pct;
 };
 
 struct metrics {
@@ -76,7 +76,7 @@ struct metrics {
     bool cpu_ok;
     int cpu_pct;
     bool memory_ok;
-    double swap_gb;
+    int memory_pct;
     int memory_pressure;
     bool clock_ok;
     char clock[65];
@@ -129,8 +129,8 @@ static void config_defaults(struct config *c)
     copy_string(c->glyph_battery_full, sizeof(c->glyph_battery_full), "");
     copy_string(c->glyph_battery_mid, sizeof(c->glyph_battery_mid), "");
     copy_string(c->glyph_battery_low, sizeof(c->glyph_battery_low), "");
-    copy_string(c->glyph_cpu, sizeof(c->glyph_cpu), "");
-    copy_string(c->glyph_memory, sizeof(c->glyph_memory), "󰍛");
+    copy_string(c->glyph_cpu, sizeof(c->glyph_cpu), "󰍛");
+    copy_string(c->glyph_memory, sizeof(c->glyph_memory), "");
     copy_string(c->glyph_clients, sizeof(c->glyph_clients), "");
     c->disk_warn_gb = 25;
     c->disk_crit_gb = 15;
@@ -138,6 +138,8 @@ static void config_defaults(struct config *c)
     c->cpu_crit_pct = 90;
     c->battery_warn_pct = 50;
     c->battery_crit_pct = 20;
+    c->memory_warn_pct = 80;
+    c->memory_crit_pct = 90;
 }
 
 static bool parse_integer(const char *s, int min, int max, int *value)
@@ -221,6 +223,8 @@ static void parse_config_value(struct config *c, const char *key, const char *va
     INT_KEY("cpu_crit_pct", cpu_crit_pct, 0, 100)
     INT_KEY("battery_warn_pct", battery_warn_pct, 0, 100)
     INT_KEY("battery_crit_pct", battery_crit_pct, 0, 100)
+    INT_KEY("memory_warn_pct", memory_warn_pct, 0, 100)
+    INT_KEY("memory_crit_pct", memory_crit_pct, 0, 100)
 #undef STRING_KEY
 #undef BOOL_KEY
 #undef INT_KEY
@@ -424,14 +428,27 @@ static bool cfnumber_int(CFTypeRef value, int *result)
            CFNumberGetValue((CFNumberRef)value, kCFNumberIntType, result);
 }
 
-static bool probe_memory(double *swap_gb, int *pressure)
+/* Memory pressure, as the kernel itself computes it: kern.memorystatus_level is
+ * memorystatus_get_available_page_count() * 100 / total_pages, i.e. the share of
+ * physical memory still available. It is the number Apple's memory_pressure(1)
+ * prints as "System-wide memory free percentage", and it is refreshed by the very
+ * same vm_pressure_response() pass that sets kern.memorystatus_vm_pressure_level,
+ * so the figure on the bar and the colour behind it can never disagree.
+ * Reported inverted — pressure, not headroom — so the number rises with trouble.
+ *
+ * Swap-in-use, which this replaced, was cumulative: on a long-lived Mac it parks
+ * at tens of gigabytes and never falls, so it signalled uptime, not pressure. */
+static bool probe_memory(int *pct, int *pressure)
 {
-    struct xsw_usage swap;
-    size_t size = sizeof(swap);
-    if (sysctlbyname("vm.swapusage", &swap, &size, NULL, 0) != 0 || size != sizeof(swap)) return false;
-    *swap_gb = (double)swap.xsu_used / (1024.0 * 1024.0 * 1024.0);
+    unsigned int level = 0;
+    size_t size = sizeof(level);
+    if (sysctlbyname("kern.memorystatus_level", &level, &size, NULL, 0) != 0 || size != sizeof(level)) return false;
+    if (level > 100) level = 100;
+    *pct = 100 - (int)level;
     size = sizeof(*pressure);
-    if (sysctlbyname("kern.memorystatus_vm_pressure_level", pressure, &size, NULL, 0) != 0) return false;
+    /* The discrete level only escalates colour, so losing it costs a shade, not
+     * the segment. */
+    if (sysctlbyname("kern.memorystatus_vm_pressure_level", pressure, &size, NULL, 0) != 0) *pressure = 0;
     return true;
 }
 
@@ -609,23 +626,23 @@ static bool read_u64_file(const char *path, uint64_t *value)
     return ok;
 }
 
-static bool probe_memory(double *swap_gb, int *pressure)
+/* Same quantity as the Darwin probe: the share of physical memory that is not
+ * available to a new allocation. Linux publishes no discrete pressure level, so
+ * the thresholds alone colour the segment. */
+static bool probe_memory(int *pct, int *pressure)
 {
     FILE *file = fopen("/proc/meminfo", "r");
     char key[64], unit[16];
-    unsigned long long value, total = 0, available = 0, swap_total = 0, swap_free = 0;
+    unsigned long long value, total = 0, available = 0;
     if (file == NULL) return false;
     while (fscanf(file, "%63s %llu %15s", key, &value, unit) == 3) {
         if (strcmp(key, "MemTotal:") == 0) total = value;
         else if (strcmp(key, "MemAvailable:") == 0) available = value;
-        else if (strcmp(key, "SwapTotal:") == 0) swap_total = value;
-        else if (strcmp(key, "SwapFree:") == 0) swap_free = value;
     }
     fclose(file);
-    if (total == 0 || swap_free > swap_total) return false;
-    *swap_gb = (double)(swap_total - swap_free) / (1024.0 * 1024.0);
-    double ratio = (double)available / (double)total;
-    *pressure = ratio <= 0.10 ? 4 : ratio <= 0.20 ? 2 : 1;
+    if (total == 0 || available > total) return false;
+    *pct = 100 - (int)((available * 100 + total / 2) / total);
+    *pressure = 0;
     return true;
 }
 
@@ -816,7 +833,7 @@ static void collect_metrics(struct metrics *m, int clients, const struct config 
     if (all || config->seg_battery)
         m->battery_ok = probe_battery(&m->battery_present, &m->battery_discharging, &m->battery_pct);
     if (all || config->seg_cpu) m->cpu_ok = probe_cpu(&m->cpu_pct);
-    if (all || config->seg_memory) m->memory_ok = probe_memory(&m->swap_gb, &m->memory_pressure);
+    if (all || config->seg_memory) m->memory_ok = probe_memory(&m->memory_pct, &m->memory_pressure);
     if (all || config->seg_clock) m->clock_ok = probe_clock(m->clock, sizeof(m->clock), config->clock_format);
 }
 
@@ -836,7 +853,7 @@ static void simulate_metrics(struct metrics *m, bool alert)
     m->battery_discharging = alert;
     m->battery_pct = alert ? 18 : 95;
     m->cpu_pct = alert ? 94 : 22;
-    m->swap_gb = alert ? 24.1 : 23.3;
+    m->memory_pct = alert ? 93 : 38;
     m->memory_pressure = alert ? 4 : 1;
     m->clients = alert ? 2 : 1;
     copy_string(m->clock, sizeof(m->clock), "14:30");
@@ -915,9 +932,9 @@ static void render(const struct config *c, const struct metrics *m, struct outbu
     }
     if (c->seg_memory && m->memory_ok) {
         const char *color = c->color_val;
-        if (m->memory_pressure >= 4) color = c->color_alert;
-        else if (m->memory_pressure >= 2) color = c->color_warn;
-        snprintf(segment, sizeof(segment), "#[fg=%s]%s #[fg=%s]%.1fG", c->color_dim, c->glyph_memory, color, m->swap_gb);
+        if (m->memory_pct >= c->memory_crit_pct || m->memory_pressure >= 4) color = c->color_alert;
+        else if (m->memory_pct >= c->memory_warn_pct || m->memory_pressure >= 2) color = c->color_warn;
+        snprintf(segment, sizeof(segment), "#[fg=%s]%s #[fg=%s]%2d%%", c->color_dim, c->glyph_memory, color, m->memory_pct);
         join_segment(out, c, segment);
     }
     if (c->seg_multi_client && (m->clients > 1 || c->always_multi_client)) {
@@ -966,7 +983,11 @@ static int run_selftest(const struct metrics *m)
     selftest_line("battery", value, m->battery_ok);
     snprintf(value, sizeof(value), m->cpu_ok ? "%d%%" : "unavailable", m->cpu_pct);
     selftest_line("cpu", value, m->cpu_ok);
-    snprintf(value, sizeof(value), m->memory_ok ? "%.1fG swap, pressure %d" : "unavailable", m->swap_gb, m->memory_pressure);
+#ifdef __APPLE__
+    snprintf(value, sizeof(value), m->memory_ok ? "%d%% pressure, kernel level %d" : "unavailable", m->memory_pct, m->memory_pressure);
+#else
+    snprintf(value, sizeof(value), m->memory_ok ? "%d%% pressure" : "unavailable", m->memory_pct);
+#endif
     selftest_line("memory", value, m->memory_ok);
     snprintf(value, sizeof(value), "%d", m->clients);
     selftest_line("multi_client", value, true);

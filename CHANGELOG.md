@@ -2,6 +2,17 @@
 
 All notable changes to tmux-sentinel are documented here. This project follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/) and uses semantic versioning.
 
+## [Unreleased]
+
+### Changed
+
+- **The memory segment reports memory pressure, not gigabytes of swap in use.** Swap used is cumulative: on a Mac that has been up for a week it parks at tens of gigabytes and never falls, so the number tracked uptime rather than anything actionable. The segment now shows the share of physical memory unavailable to a new allocation — on macOS `100 - kern.memorystatus_level`, the figure `memory_pressure(1)` prints as "System-wide memory free percentage", refreshed by the same kernel pass that sets `kern.memorystatus_vm_pressure_level`, so the number and its colour cannot disagree; on Linux `100 - MemAvailable / MemTotal`. `status-fallback.sh` computes the same quantity from the same sources, so building the binary does not change what the number means.
+- The nerd-font `cpu` and `memory` glyphs traded places. `nf-md-memory` (U+F035B) draws a chip with a single core at its centre and now marks cpu; `nf-fa-microchip` (U+F2DB) draws a chip filled with a grid of cells and now marks memory. The unicode and ascii sets are unchanged — `⚙`/`CPU` and `▤`/`MEM` already read the right way round.
+
+### Added
+
+- `@sentinel_memory_warn_pct` (default `80`) and `@sentinel_memory_crit_pct` (default `90`) colour the memory segment. macOS still escalates on the kernel's own verdict — warning at pressure level 2, alert at level 4 — whatever the thresholds say, so a jetsam-grade event is never shown as healthy. Linux previously hardcoded the equivalent 20%/10%-available steps; they are now configurable.
+
 ## [0.3.0] - 2026-08-26
 
 Free disk space is on the bar by default, and every segment's resting visibility is now controlled individually.

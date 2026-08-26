@@ -5,8 +5,11 @@
 # Used only while bin/sentinel-status has not been built. Renders four of the
 # eight segments: disk, cpu, memory and clock. The cpu figure here is a load
 # average, not a utilisation percentage, and is shown as such (no `%`) so the
-# bar never claims precision it does not have. Once `make` produces the binary,
-# scripts/generate.sh re-points status-right at it automatically.
+# bar never claims precision it does not have. The memory figure IS the same
+# quantity the binary reports — percent of physical memory unavailable — so
+# building the binary does not change what that number means. Once `make`
+# produces the binary, scripts/generate.sh re-points status-right at it
+# automatically.
 #
 # Fork budget: 3 on Darwin (df, sysctl, date), 2 on Linux (df, date); /proc and
 # sentinel.state are read with shell builtins.
@@ -42,6 +45,8 @@ disk_warn_gb=25
 disk_crit_gb=15
 cpu_warn_pct=70
 cpu_crit_pct=90
+memory_warn_pct=80
+memory_crit_pct=90
 
 STATE="${XDG_CONFIG_HOME:-$HOME/.config}/tmux-sentinel/sentinel.state"
 
@@ -71,6 +76,8 @@ if [ -r "$STATE" ]; then
 		disk_crit_gb) disk_crit_gb=$value ;;
 		cpu_warn_pct) cpu_warn_pct=$value ;;
 		cpu_crit_pct) cpu_crit_pct=$value ;;
+		memory_warn_pct) memory_warn_pct=$value ;;
+		memory_crit_pct) memory_crit_pct=$value ;;
 		esac
 	done <"$STATE"
 fi
@@ -79,7 +86,7 @@ fi
 # rather than poisoning the arithmetic below.
 _v=
 for _n in always_disk disk_warn_gb disk_crit_gb cpu_warn_pct cpu_crit_pct \
-	seg_disk seg_cpu seg_memory seg_clock; do
+	memory_warn_pct memory_crit_pct seg_disk seg_cpu seg_memory seg_clock; do
 	eval "_v=\$$_n"
 	case $_v in
 	'' | *[!0-9]*) eval "$_n=0" ;;
@@ -105,7 +112,8 @@ fi
 load_txt=
 load_hundredths=0
 ncpu=1
-swap_tenths=
+mem_pct=
+mem_pressure=0
 
 if [ -r /proc/loadavg ]; then
 	while read -r l1 _rest; do
@@ -119,30 +127,34 @@ if [ -r /proc/loadavg ]; then
 		esac
 	done </proc/cpuinfo 2>/dev/null || ncpu=0
 	[ "$ncpu" -ge 1 ] || ncpu=1
-	swap_total=0
-	swap_free=0
+	# Percent of physical memory unavailable to a new allocation — the Linux
+	# spelling of Darwin's kern.memorystatus_level, inverted.
+	mem_total=0
+	mem_avail=0
 	while read -r mkey mval _munit; do
 		case $mkey in
-		SwapTotal:) swap_total=$mval ;;
-		SwapFree:) swap_free=$mval ;;
+		MemTotal:) mem_total=$mval ;;
+		MemAvailable:) mem_avail=$mval ;;
 		esac
 	done </proc/meminfo 2>/dev/null
-	case $swap_total$swap_free in
+	case $mem_total$mem_avail in
 	'' | *[!0-9]*) ;;
 	*)
-		if [ "$swap_total" -ge "$swap_free" ]; then
-			swap_tenths=$(((swap_total - swap_free) * 10 / 1048576))
+		if [ "$mem_total" -gt 0 ] && [ "$mem_avail" -le "$mem_total" ]; then
+			mem_pct=$((100 - (mem_avail * 100 + mem_total / 2) / mem_total))
 		fi
 		;;
 	esac
 else
-	sysctl_out=$(sysctl -n vm.loadavg hw.ncpu vm.swapusage 2>/dev/null) || sysctl_out=
+	sysctl_out=$(sysctl -n vm.loadavg hw.ncpu kern.memorystatus_level kern.memorystatus_vm_pressure_level 2>/dev/null) || sysctl_out=
 	if [ -n "$sysctl_out" ]; then
 		sc_line1=${sysctl_out%%"$NL"*}
 		sc_rest=${sysctl_out#*"$NL"}
 		sc_line2=${sc_rest%%"$NL"*}
-		sc_line3=${sc_rest#*"$NL"}
-		sc_line3=${sc_line3%%"$NL"*}
+		sc_rest=${sc_rest#*"$NL"}
+		sc_line3=${sc_rest%%"$NL"*}
+		sc_line4=${sc_rest#*"$NL"}
+		sc_line4=${sc_line4%%"$NL"*}
 
 		# vm.loadavg reads `{ 1.23 1.10 0.98 }`.
 		# shellcheck disable=SC2086 # deliberate word splitting
@@ -156,26 +168,20 @@ else
 		esac
 		[ "$ncpu" -ge 1 ] || ncpu=1
 
-		# vm.swapusage reads `total = 1024.00M  used = 12.50M  free = ...`.
-		# shellcheck disable=SC2086 # deliberate word splitting
-		set -- $sc_line3
-		if [ $# -ge 6 ]; then
-			used=$6
-			unit=${used#"${used%?}"}
-			num=${used%?}
-			case $unit in
-			K | k) mib=$((${num%%.*} / 1024)) ;;
-			M | m) mib=${num%%.*} ;;
-			G | g) mib=$((${num%%.*} * 1024)) ;;
-			*)
-				mib=
-				;;
-			esac
-			case ${mib:-x} in
-			'' | *[!0-9]*) ;;
-			*) swap_tenths=$((mib * 10 / 1024)) ;;
-			esac
-		fi
+		# kern.memorystatus_level is the kernel's own percent-available
+		# figure, the one memory_pressure(1) prints; report its inverse.
+		case $sc_line3 in
+		'' | *[!0-9]*) ;;
+		*)
+			if [ "$sc_line3" -le 100 ]; then
+				mem_pct=$((100 - sc_line3))
+			fi
+			;;
+		esac
+		case $sc_line4 in
+		'' | *[!0-9]*) ;;
+		*) mem_pressure=$sc_line4 ;;
+		esac
 	fi
 fi
 
@@ -234,8 +240,11 @@ if [ "$seg_cpu" = 1 ] && [ -n "$load_txt" ]; then
 	add "#[fg=$color_dim]$glyph_cpu #[fg=$colour]load $load_txt"
 fi
 
-if [ "$seg_memory" = 1 ] && [ -n "$swap_tenths" ]; then
-	add "#[fg=$color_dim]$glyph_memory #[fg=$color_val]$((swap_tenths / 10)).$((swap_tenths % 10))G"
+if [ "$seg_memory" = 1 ] && [ -n "$mem_pct" ]; then
+	colour=$color_val
+	if [ "$mem_pct" -ge "$memory_warn_pct" ] || [ "$mem_pressure" -ge 2 ]; then colour=$color_warn; fi
+	if [ "$mem_pct" -ge "$memory_crit_pct" ] || [ "$mem_pressure" -ge 4 ]; then colour=$color_alert; fi
+	add "#[fg=$color_dim]$glyph_memory #[fg=$colour]$mem_pct%"
 fi
 
 if [ "$seg_clock" = 1 ]; then

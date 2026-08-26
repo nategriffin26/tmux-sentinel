@@ -102,3 +102,17 @@ set -ogq @sentinel_battery_warn_pct "50"
 # Battery charge percentage below which a discharging battery turns
 # alert-coloured and takes the low icon. Domain: integer 0..100.
 set -ogq @sentinel_battery_crit_pct "20"
+
+# Memory pressure percentage at or above which the memory segment turns
+# warning-coloured. Pressure is the share of physical memory unavailable to a
+# new allocation: on macOS `100 - kern.memorystatus_level`, the figure
+# memory_pressure(1) prints inverted; on Linux `100 - MemAvailable/MemTotal`.
+# macOS also escalates to this colour whenever the kernel itself reports
+# pressure level 2 (warning), whatever this threshold says.
+# Domain: integer 0..100. Comparison is `>=`.
+set -ogq @sentinel_memory_warn_pct "80"
+
+# Memory pressure percentage at or above which the memory segment turns
+# alert-coloured. macOS also escalates to this colour at kernel pressure
+# level 4 (critical). Domain: integer 0..100. Comparison is `>=`.
+set -ogq @sentinel_memory_crit_pct "90"

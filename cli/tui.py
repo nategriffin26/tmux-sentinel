@@ -199,6 +199,8 @@ THRESHOLDS = (
     ("cpu_crit_pct", "CPU critical (%)", 5),
     ("battery_warn_pct", "Battery warning (%)", 5),
     ("battery_crit_pct", "Battery critical (%)", 5),
+    ("memory_warn_pct", "Memory warning (%)", 5),
+    ("memory_crit_pct", "Memory critical (%)", 5),
 )
 
 SEGMENT_HELP = {
@@ -207,7 +209,7 @@ SEGMENT_HELP = {
     "disk": "free disk space",
     "battery": "charge level while discharging",
     "cpu": "CPU utilisation",
-    "memory": "swap use and memory pressure",
+    "memory": "memory pressure",
     "multi_client": "shown when more than one client is attached",
     "clock": "the time",
 }
