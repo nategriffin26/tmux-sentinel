@@ -15,13 +15,13 @@ jobs:
       matrix:
         arch: [arm64, x86_64]
     steps:
-      - uses: actions/checkout@v4.2.2
+      - uses: actions/checkout@v7.0.1
       - name: Build ${{ matrix.arch }} binary
         run: |
           make clean
           make CC=clang CFLAGS="-O2 -Wall -Wextra -Wpedantic -Werror -arch ${{ matrix.arch }}"
           mv bin/sentinel-status "bin/sentinel-status-darwin-${{ matrix.arch }}"
-      - uses: actions/upload-artifact@v4.6.2
+      - uses: actions/upload-artifact@v7.0.1
         with:
           name: sentinel-status-darwin-${{ matrix.arch }}
           path: bin/sentinel-status-darwin-${{ matrix.arch }}
@@ -29,13 +29,13 @@ jobs:
   linux:
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4.2.2
+      - uses: actions/checkout@v7.0.1
       - name: Build Linux x86_64 binary
         run: |
           make clean
           make CC=cc CFLAGS='-O2 -Wall -Wextra -Wpedantic -Werror'
           mv bin/sentinel-status bin/sentinel-status-linux-x86_64
-      - uses: actions/upload-artifact@v4.6.2
+      - uses: actions/upload-artifact@v7.0.1
         with:
           name: sentinel-status-linux-x86_64
           path: bin/sentinel-status-linux-x86_64
@@ -44,8 +44,8 @@ jobs:
     needs: [macos, linux]
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4.2.2
-      - uses: actions/download-artifact@v4.3.0
+      - uses: actions/checkout@v7.0.1
+      - uses: actions/download-artifact@v7.0.1
         with:
           path: dist
       - name: Make release assets executable
@@ -58,7 +58,7 @@ jobs:
             found && /^## / { exit }
             found { print }
           ' CHANGELOG.md > release-notes.md
-      - uses: softprops/action-gh-release@v2.2.2
+      - uses: softprops/action-gh-release@v3.0.2
         with:
           body_path: release-notes.md
           files: dist/*/sentinel-status-*
