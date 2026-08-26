@@ -69,16 +69,25 @@ jobs:
           done
           tmux -L ci kill-server
 
-  python:
-    runs-on: ubuntu-latest
+  tests:
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest]
+    runs-on: ${{ matrix.os }}
     steps:
       - uses: actions/checkout@v4.2.2
-      - name: Compile Python modules
-        run: python3 -m compileall cli/
-      - name: Run pytest when present
+      - name: Install tmux
         run: |
-          if compgen -G 'test/test_*.py' > /dev/null || compgen -G 'test/*_test.py' > /dev/null; then
-            python3 -m pytest test/
+          if [ "$RUNNER_OS" = "Linux" ]; then
+            sudo apt-get update && sudo apt-get install --yes tmux
           else
-            echo 'No pytest suite present; skipping.'
+            brew install tmux
           fi
+      - name: Compile Python modules
+        run: python3 -m compileall -q cli/
+      # The suite is stdlib unittest on purpose: CI needs nothing installed
+      # beyond python3 and tmux. Every test isolates itself with a private
+      # tmux socket and a scratch XDG_CONFIG_HOME.
+      - name: Run the test suite
+        run: make test

@@ -628,6 +628,15 @@ static bool read_text_file(const char *path, char *value, size_t size)
     return true;
 }
 
+/* Build "<dir>/<leaf>", reporting truncation instead of silently producing a
+ * half-formed path. Concatenating two PATH_MAX buffers is also exactly what
+ * GCC's -Wformat-truncation objects to unless the result is checked. */
+static bool path_join(char *out, size_t size, const char *dir, const char *leaf)
+{
+    int written = snprintf(out, size, "%s/%s", dir, leaf);
+    return written > 0 && (size_t)written < size;
+}
+
 static bool probe_battery(bool *present, bool *discharging, int *percentage)
 {
     DIR *dir = opendir("/sys/class/power_supply");
@@ -640,25 +649,27 @@ static bool probe_battery(bool *present, bool *discharging, int *percentage)
         uint64_t now = 0, full = 0, capacity = 0;
         if (entry->d_name[0] == '.') continue;
         if (snprintf(base, sizeof(base), "/sys/class/power_supply/%s", entry->d_name) >= (int)sizeof(base)) continue;
-        snprintf(path, sizeof(path), "%s/type", base);
+        if (!path_join(path, sizeof(path), base, "type")) continue;
         if (!read_text_file(path, type, sizeof(type)) || strcmp(type, "Battery") != 0) continue;
         any = true;
-        snprintf(path, sizeof(path), "%s/status", base);
-        if (read_text_file(path, status, sizeof(status)) && strcmp(status, "Discharging") == 0) any_discharging = true;
-        snprintf(path, sizeof(path), "%s/energy_now", base);
-        bool have_now = read_u64_file(path, &now);
-        snprintf(path, sizeof(path), "%s/energy_full", base);
-        bool have_full = read_u64_file(path, &full);
+        if (path_join(path, sizeof(path), base, "status") &&
+            read_text_file(path, status, sizeof(status)) &&
+            strcmp(status, "Discharging") == 0) any_discharging = true;
+        bool have_now = path_join(path, sizeof(path), base, "energy_now") &&
+                        read_u64_file(path, &now);
+        bool have_full = path_join(path, sizeof(path), base, "energy_full") &&
+                         read_u64_file(path, &full);
         if (!have_now || !have_full || full == 0) {
-            snprintf(path, sizeof(path), "%s/charge_now", base);
-            have_now = read_u64_file(path, &now);
-            snprintf(path, sizeof(path), "%s/charge_full", base);
-            have_full = read_u64_file(path, &full);
+            have_now = path_join(path, sizeof(path), base, "charge_now") &&
+                       read_u64_file(path, &now);
+            have_full = path_join(path, sizeof(path), base, "charge_full") &&
+                        read_u64_file(path, &full);
         }
         if (have_now && have_full && full > 0) { now_sum += now; full_sum += full; }
-        else {
-            snprintf(path, sizeof(path), "%s/capacity", base);
-            if (read_u64_file(path, &capacity) && capacity <= 100) { now_sum += capacity; full_sum += 100; }
+        else if (path_join(path, sizeof(path), base, "capacity") &&
+                 read_u64_file(path, &capacity) && capacity <= 100) {
+            now_sum += capacity;
+            full_sum += 100;
         }
     }
     closedir(dir);
@@ -690,9 +701,9 @@ static void scan_thermal_zones(int *hottest, bool *found)
         uint64_t temp;
         if (strncmp(entry->d_name, "thermal_zone", 12) != 0) continue;
         if (snprintf(base, sizeof(base), "/sys/class/thermal/%s", entry->d_name) >= (int)sizeof(base)) continue;
-        snprintf(path, sizeof(path), "%s/type", base);
+        if (!path_join(path, sizeof(path), base, "type")) continue;
         if (!read_text_file(path, type, sizeof(type)) || !thermal_type_cpu(type)) continue;
-        snprintf(path, sizeof(path), "%s/temp", base);
+        if (!path_join(path, sizeof(path), base, "temp")) continue;
         if (read_u64_file(path, &temp)) {
             int celsius = temp > 1000 ? (int)(temp / 1000) : (int)temp;
             if (!*found || celsius > *hottest) *hottest = celsius;
@@ -707,8 +718,9 @@ static void scan_hwmon(const char *root, int *hottest, bool *found)
     DIR *dir = opendir(root);
     struct dirent *entry;
     char path[PATH_MAX], device_name[128] = "";
-    snprintf(path, sizeof(path), "%s/name", root);
-    bool device_is_cpu = read_text_file(path, device_name, sizeof(device_name)) && thermal_type_cpu(device_name);
+    bool device_is_cpu = path_join(path, sizeof(path), root, "name") &&
+                         read_text_file(path, device_name, sizeof(device_name)) &&
+                         thermal_type_cpu(device_name);
     if (dir == NULL) return;
     while ((entry = readdir(dir)) != NULL) {
         size_t len = strlen(entry->d_name);
@@ -721,12 +733,13 @@ static void scan_hwmon(const char *root, int *hottest, bool *found)
         if (stem + strlen("_label") < sizeof(label_name)) {
             memcpy(label_name, entry->d_name, stem);
             copy_string(label_name + stem, sizeof(label_name) - stem, "_label");
-            snprintf(path, sizeof(path), "%s/%s", root, label_name);
-            if (read_text_file(path, label, sizeof(label)) && thermal_type_cpu(label)) sensor_is_cpu = true;
+            if (path_join(path, sizeof(path), root, label_name) &&
+                read_text_file(path, label, sizeof(label)) &&
+                thermal_type_cpu(label)) sensor_is_cpu = true;
         }
         if (!sensor_is_cpu) continue;
         uint64_t temp;
-        snprintf(path, sizeof(path), "%s/%s", root, entry->d_name);
+        if (!path_join(path, sizeof(path), root, entry->d_name)) continue;
         if (read_u64_file(path, &temp)) {
             int celsius = temp > 1000 ? (int)(temp / 1000) : (int)temp;
             if (!*found || celsius > *hottest) *hottest = celsius;

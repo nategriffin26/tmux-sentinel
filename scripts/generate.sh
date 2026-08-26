@@ -84,7 +84,9 @@ fi
 tmp_state=
 tmp_conf=
 # Invoked from the trap below, so a failed run leaves no half-written temp file.
-# shellcheck disable=SC2329
+# ShellCheck cannot see trap-driven calls: older versions flag the body as
+# unreachable (SC2317), newer ones flag the function as unused (SC2329).
+# shellcheck disable=SC2317,SC2329
 cleanup() {
 	if [ -n "$tmp_state" ]; then rm -f "$tmp_state"; fi
 	if [ -n "$tmp_conf" ]; then rm -f "$tmp_conf"; fi
